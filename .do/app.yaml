@@ -1,0 +1,20 @@
+name: tnh-inbox
+region: sgp
+services:
+  - name: tnh-inbox
+    github:
+      repo: tigernethost/tnh-inbox
+      branch: main
+      deploy_on_push: true
+    run_command: node index.js
+    environment_slug: node-js
+    instance_count: 1
+    instance_size_slug: apps-s-1vcpu-0.5gb
+    http_port: 3000
+    routes:
+      - path: /
+    envs:
+      - key: NODE_ENV
+        value: production
+      - key: TZ
+        value: Asia/Manila
