@@ -158,50 +158,64 @@ app.post('/webhook/telegram', async (req, res) => {
     if (!msg) return;
 
     const chatId = msg.chat.id;
+    const chatType = msg.chat.type; // 'private', 'group', 'supergroup', 'channel'
+    const chatTitle = msg.chat.title || 'Direct Message';
     const from = msg.from?.first_name || 'Unknown';
     const username = msg.from?.username ? `@${msg.from.username}` : '';
-    const text = msg.text || '[non-text message]';
+    const text = msg.text || '';
     const time = new Date().toLocaleTimeString('en-PH', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit' });
 
-    console.log(`[Telegram] ${from} ${username}: ${text}`);
+    const isGroup = chatType === 'group' || chatType === 'supergroup';
+    const isPrivate = chatType === 'private';
 
-    // Forward to Discord
+    // In groups, only respond when tagged @TigerAIAssist_bot or on /commands
+    const botMentioned = text.includes('@TigerAIAssist_bot');
+    const isCommand = text.startsWith('/');
+    const cleanText = text.replace('@TigerAIAssist_bot', '').trim();
+
+    console.log(`[Telegram][${chatType}] ${from} ${username} in "${chatTitle}": ${text}`);
+
+    // Always forward ALL messages to Discord
     await axios.post(DISCORD, {
       username: 'TigerAI — Telegram',
       embeds: [{
-        title: `📨 New Telegram Message`,
-        description: text,
-        color: 0x229ED9,
+        title: isGroup ? `💬 Group Message — ${chatTitle}` : `📨 Direct Message`,
+        description: text || '[non-text message]',
+        color: isGroup ? 0x22c55e : 0x229ED9,
         fields: [
           { name: 'From', value: `${from} ${username}`, inline: true },
-          { name: 'Chat ID', value: `${chatId}`, inline: true },
+          { name: 'Chat', value: isGroup ? chatTitle : 'Private', inline: true },
           { name: 'Time', value: `${time} PHT`, inline: true }
         ],
-        footer: { text: '@TigerAIAssist_bot' }
+        footer: { text: `@TigerAIAssist_bot · Chat ID: ${chatId}` }
       }]
     }).catch(e => console.log('Discord forward error:', e.message));
 
-    // Auto-reply based on message
-    const lower = text.toLowerCase();
-    if (lower === '/start' || lower === 'hi' || lower === 'hello') {
-      await sendTelegram(chatId,
-        `👋 Hello ${from}! Welcome to *Tigernethost OPC*.\n\nHow can we help you today?\n\n` +
-        `• Cloud Hosting\n• Domain Registration\n• IT Consulting\n• Software Development\n\n` +
-        `Type your inquiry and our team will get back to you shortly.`
-      );
+    // In groups: only reply if tagged or it's a command
+    if (isGroup && !botMentioned && !isCommand) return;
+
+    // Determine what to reply to
+    const replyText = isGroup ? cleanText : text;
+    const lower = replyText.toLowerCase();
+
+    // Build reply
+    let reply = '';
+    if (lower === '/start' || lower === 'hi' || lower === 'hello' || lower === '') {
+      reply = isGroup
+        ? `👋 Hello! I'm *TigerAI*, the assistant bot of *Tigernethost OPC*.\n\nTag me anytime with @TigerAIAssist_bot to get help!\n\n• Cloud Hosting\n• Domain Registration\n• IT Consulting\n• Software Development`
+        : `👋 Hello ${from}! Welcome to *Tigernethost OPC*.\n\nHow can we help you today?\n\n• Cloud Hosting\n• Domain Registration\n• IT Consulting\n• Software Development\n\nType your inquiry and our team will get back to you shortly.`;
     } else if (lower.includes('price') || lower.includes('cost') || lower.includes('quote')) {
-      await sendTelegram(chatId,
-        `💰 Thank you for your interest!\n\nPlease visit our website for pricing:\n🌐 https://tigernethost.com\n\nOr send us your requirements and we'll prepare a custom quote for you.`
-      );
-    } else if (lower.includes('support') || lower.includes('help') || lower.includes('issue')) {
-      await sendTelegram(chatId,
-        `🛠️ *Support Request Received*\n\nWe've noted your concern and our team has been notified.\n\nExpected response time: *within 24 hours*\n\nFor urgent concerns, email us at: support@tigernethost.com`
-      );
+      reply = `💰 Thank you for your interest!\n\nPlease visit our website for pricing:\n🌐 https://tigernethost.com\n\nOr send us your requirements and we'll prepare a custom quote for you.`;
+    } else if (lower.includes('support') || lower.includes('help') || lower.includes('issue') || lower.includes('problem')) {
+      reply = `🛠️ *Support Request Received*\n\nWe've noted your concern and our team has been notified.\n\nExpected response time: *within 24 hours*\n\nFor urgent concerns:\n📧 support@tigernethost.com`;
+    } else if (lower.includes('invoice') || lower.includes('payment') || lower.includes('billing')) {
+      reply = `💳 *Billing Inquiry*\n\nThank you, ${from}. Our billing team has been notified and will follow up with you shortly.\n\n📧 billing@tigernethost.com\n🌐 https://tigernethost.com/portal`;
     } else {
-      await sendTelegram(chatId,
-        `✅ *Message received!*\n\nThank you, ${from}. Our team at *Tigernethost OPC* has been notified and will respond shortly.\n\n📧 support@tigernethost.com\n🌐 tigernethost.com`
-      );
+      reply = `✅ *Message received!*\n\nThank you, ${from}. Our team at *Tigernethost OPC* has been notified and will respond shortly.\n\n📧 support@tigernethost.com\n🌐 tigernethost.com`;
     }
+
+    await sendTelegram(chatId, reply);
+
   } catch (err) {
     console.error('[Telegram] Handler error:', err.message);
   }
