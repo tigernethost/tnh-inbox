@@ -139,7 +139,75 @@ app.get('/briefing/send', async (req, res) => {
   res.json(result);
 });
 
-// Webhook receiver for future integrations (Viber, Telegram, Facebook)
+// Telegram bot handler
+const TELEGRAM_TOKEN = '8225869241:AAFeO_a1nRFs4rTo_U4kTyjQasT9q8_Lv08';
+
+const sendTelegram = async (chatId, text) => {
+  await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+    chat_id: chatId,
+    text,
+    parse_mode: 'Markdown'
+  });
+};
+
+app.post('/webhook/telegram', async (req, res) => {
+  res.json({ ok: true }); // Always respond immediately to Telegram
+  try {
+    const update = req.body;
+    const msg = update.message;
+    if (!msg) return;
+
+    const chatId = msg.chat.id;
+    const from = msg.from?.first_name || 'Unknown';
+    const username = msg.from?.username ? `@${msg.from.username}` : '';
+    const text = msg.text || '[non-text message]';
+    const time = new Date().toLocaleTimeString('en-PH', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit' });
+
+    console.log(`[Telegram] ${from} ${username}: ${text}`);
+
+    // Forward to Discord
+    await axios.post(DISCORD, {
+      username: 'TigerAI — Telegram',
+      embeds: [{
+        title: `📨 New Telegram Message`,
+        description: text,
+        color: 0x229ED9,
+        fields: [
+          { name: 'From', value: `${from} ${username}`, inline: true },
+          { name: 'Chat ID', value: `${chatId}`, inline: true },
+          { name: 'Time', value: `${time} PHT`, inline: true }
+        ],
+        footer: { text: '@TigerAIAssist_bot' }
+      }]
+    }).catch(e => console.log('Discord forward error:', e.message));
+
+    // Auto-reply based on message
+    const lower = text.toLowerCase();
+    if (lower === '/start' || lower === 'hi' || lower === 'hello') {
+      await sendTelegram(chatId,
+        `👋 Hello ${from}! Welcome to *Tigernethost OPC*.\n\nHow can we help you today?\n\n` +
+        `• Cloud Hosting\n• Domain Registration\n• IT Consulting\n• Software Development\n\n` +
+        `Type your inquiry and our team will get back to you shortly.`
+      );
+    } else if (lower.includes('price') || lower.includes('cost') || lower.includes('quote')) {
+      await sendTelegram(chatId,
+        `💰 Thank you for your interest!\n\nPlease visit our website for pricing:\n🌐 https://tigernethost.com\n\nOr send us your requirements and we'll prepare a custom quote for you.`
+      );
+    } else if (lower.includes('support') || lower.includes('help') || lower.includes('issue')) {
+      await sendTelegram(chatId,
+        `🛠️ *Support Request Received*\n\nWe've noted your concern and our team has been notified.\n\nExpected response time: *within 24 hours*\n\nFor urgent concerns, email us at: support@tigernethost.com`
+      );
+    } else {
+      await sendTelegram(chatId,
+        `✅ *Message received!*\n\nThank you, ${from}. Our team at *Tigernethost OPC* has been notified and will respond shortly.\n\n📧 support@tigernethost.com\n🌐 tigernethost.com`
+      );
+    }
+  } catch (err) {
+    console.error('[Telegram] Handler error:', err.message);
+  }
+});
+
+// Webhook receiver for other platforms (Viber, Facebook)
 app.post('/webhook/:platform', (req, res) => {
   const { platform } = req.params;
   console.log(`[${platform}] Webhook:`, JSON.stringify(req.body).slice(0, 300));
@@ -147,7 +215,6 @@ app.post('/webhook/:platform', (req, res) => {
 });
 
 app.get('/webhook/:platform', (req, res) => {
-  // Verification endpoint for Facebook/Viber webhook setup
   const { platform } = req.params;
   const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': challenge } = req.query;
   if (mode === 'subscribe' && challenge) {
