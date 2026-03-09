@@ -486,6 +486,34 @@ app.post('/webhook/telegram', async (req, res) => {
 });
 
 // ── Morning Briefing ─────────────────────────────────────────────────────────
+// ── Fetch Google Calendar events for today ───────────────────────────────
+async function getTodayCalendarEvents() {
+  try {
+    const GCAL_CALENDAR_ID = process.env.GCAL_CALENDAR_ID || 'tigernethost@gmail.com';
+    const GCAL_API_KEY = process.env.GCAL_API_KEY;
+    const GCAL_TOKEN = process.env.GCAL_TOKEN;
+    if (!GCAL_TOKEN && !GCAL_API_KEY) return [];
+
+    const now = new Date();
+    const manilaOffset = 8 * 60;
+    const utcMs = now.getTime() + (now.getTimezoneOffset() * 60000);
+    const manilaDate = new Date(utcMs + manilaOffset * 60000);
+    const todayStart = new Date(manilaDate); todayStart.setHours(0,0,0,0);
+    const todayEnd = new Date(manilaDate); todayEnd.setHours(23,59,59,999);
+
+    const toISO = (d) => new Date(d.getTime() - manilaOffset * 60000).toISOString();
+
+    const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(GCAL_CALENDAR_ID)}/events?timeMin=${toISO(todayStart)}&timeMax=${toISO(todayEnd)}&singleEvents=true&orderBy=startTime`;
+    const headers = GCAL_TOKEN ? { Authorization: `Bearer ${GCAL_TOKEN}` } : {};
+
+    const resp = await axios.get(url, { headers, timeout: 8000 });
+    return resp.data.items || [];
+  } catch (e) {
+    console.log('Google Calendar fetch error:', e.message);
+    return [];
+  }
+}
+
 async function sendMorningBriefing() {
   const now = new Date();
   const dateStr = now.toLocaleDateString('en-PH', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Asia/Manila' });
@@ -503,19 +531,38 @@ async function sendMorningBriefing() {
       const qr = await axios.get(`${MGR_URL}/index?model=SalesQuote`, { timeout: 8000 });
       mgrQuotes = (qr.data || []).filter(q => q.Status !== 'Converted' && q.Status !== 'Declined');
     } catch (e) { console.log('Manager.io:', e.message); }
+
+    // Fetch today's calendar events
+    const calEvents = await getTodayCalendarEvents();
+
     const linkedGroups = db.prepare('SELECT COUNT(*) as c FROM group_links').get().c;
     const pendingHandoffs = db.prepare("SELECT COUNT(*) as c FROM agent_handoffs WHERE status='pending'").get().c;
+
     const fields = [
       { name: '📊 WHMCS', value: `Unpaid: **${allInv.length}**\nDue soon: **${soon.length}**`, inline: true },
       { name: '🧾 Manager.io', value: `Invoices: **${mgrUnpaid.length}**\nTotal: **₱${mgrTotal.toLocaleString('en-PH')}**`, inline: true },
       { name: '🤖 Bot', value: `Linked GCs: **${linkedGroups}**\n⚠️ Pending handoffs: **${pendingHandoffs}**`, inline: true },
     ];
+
+    // Add today's schedule
+    if (calEvents.length > 0) {
+      const scheduleText = calEvents.map(e => {
+        const start = e.start?.dateTime ? new Date(e.start.dateTime).toLocaleTimeString('en-PH', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Manila' }) : 'All Day';
+        const loc = e.location ? ` 📍 ${e.location}` : '';
+        return `• **${start}** — ${e.summary}${loc}`;
+      }).join('\n');
+      fields.unshift({ name: `📅 Today's Schedule (${calEvents.length} event${calEvents.length > 1 ? 's' : ''})`, value: scheduleText, inline: false });
+    } else {
+      fields.unshift({ name: '📅 Today\'s Schedule', value: '_No meetings scheduled today_', inline: false });
+    }
+
     if (mgrQuotes.length > 0) fields.push({ name: '📋 Quotes', value: `**${mgrQuotes.length}** pending`, inline: true });
     if (overdue.length > 0) fields.push({ name: '⚠️ Overdue', value: overdue.map(i => `• #${i.id} — ${i.currencyprefix || '₱'}${parseFloat(i.total).toFixed(2)} (${i.duedate})`).join('\n'), inline: false });
     if (soon.length > 0) fields.push({ name: '📅 Due Soon', value: soon.map(i => `• #${i.id} — ${i.currencyprefix || '₱'}${parseFloat(i.total).toFixed(2)} (${i.duedate})`).join('\n'), inline: false });
+
     await axios.post(DISCORD, { username: 'Claude AI — TNH Morning Briefing', embeds: [{ title: `☀️ Good Morning, Macky! — ${dateStr}`, description: 'Daily briefing for **Tigernethost OPC**.', color: 0xf7c948, fields, footer: { text: `inbox.tigernethost.com · ${timeStr} PHT · Node ${process.version}` } }] });
     console.log(`✅ Briefing sent at ${timeStr}`);
-    return { success: true, whmcsUnpaid: allInv.length, mgrTotal, overdueCount: overdue.length };
+    return { success: true, whmcsUnpaid: allInv.length, mgrTotal, overdueCount: overdue.length, calendarEvents: calEvents.length };
   } catch (err) { return { success: false, error: err.message }; }
 }
 
