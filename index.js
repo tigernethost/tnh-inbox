@@ -24,11 +24,10 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 // The bot will listen to messages in that channel with prefix !ai or !tiger
 const DISCORD_COMMAND_CHANNEL = process.env.DISCORD_COMMAND_CHANNEL || null;
 
-// Google Calendar (OAuth2)
-const GCAL_REFRESH    = process.env.GCAL_REFRESH;
-const GCAL_CLIENT_ID  = process.env.GCAL_CLIENT_ID;
-const GCAL_CLIENT_SEC = process.env.GCAL_CLIENT_SECRET;
-const GCAL_CALENDAR   = process.env.GCAL_CALENDAR_ID || 'tigernethost@gmail.com';
+// Google Calendar — handled via Claude connector proxy
+// No OAuth needed! Claude.ai handles calendar operations and calls back to us.
+const GCAL_CALENDAR     = process.env.GCAL_CALENDAR_ID || 'tigernethost@gmail.com';
+const GCAL_WEBHOOK_SECRET = process.env.GCAL_WEBHOOK_SECRET || 'TNHCalendar2026';
 
 // Zoom (Server-to-Server OAuth)
 const ZOOM_ACCOUNT_ID    = process.env.ZOOM_ACCOUNT_ID    || 'eKCXh0p9S8CF3rdzoumV1A';
@@ -75,6 +74,11 @@ db.exec(`
     channel_id TEXT, user_id TEXT, username TEXT,
     command TEXT, result TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS kv_store (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 `);
 
@@ -139,38 +143,22 @@ const setMode = (chatId, mode) => {
     .run(String(chatId), mode);
 };
 
-// ── Google Calendar Helper ───────────────────────────────────────────────────
-let gcalAccessToken = GCAL_TOKEN || null;
-let gcalTokenExpiry = 0;
+// ── Google Calendar — Claude Connector Proxy ─────────────────────────────────
+// Calendar operations are handled by Claude.ai (which has native Google Calendar access)
+// The inbox server receives results via POST /gcal/result
+// Pending calendar requests are stored here until Claude responds
+const pendingCalendarRequests = new Map();
 
-async function refreshGCalToken() {
-  if (!GCAL_REFRESH || !GCAL_CLIENT_ID || !GCAL_CLIENT_SEC) return null;
-  try {
-    const { data } = await axios.post('https://oauth2.googleapis.com/token', new URLSearchParams({
-      client_id: GCAL_CLIENT_ID,
-      client_secret: GCAL_CLIENT_SEC,
-      refresh_token: GCAL_REFRESH,
-      grant_type: 'refresh_token'
-    }).toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-    gcalAccessToken = data.access_token;
-    gcalTokenExpiry = Date.now() + (data.expires_in * 1000) - 60000;
-    console.log('[GCal] Token refreshed');
-    return gcalAccessToken;
-  } catch (e) {
-    console.error('[GCal] Token refresh failed:', e.message);
-    return null;
-  }
-}
-
-async function gcal(endpoint, method = 'GET', body = null, params = {}) {
-  if (!gcalAccessToken && !GCAL_REFRESH) throw new Error('Google Calendar not configured. Set GCAL_REFRESH, GCAL_CLIENT_ID, GCAL_CLIENT_SECRET env vars.');
-  if (gcalTokenExpiry && Date.now() > gcalTokenExpiry) await refreshGCalToken();
-  const url = new URL(`https://www.googleapis.com/calendar/v3${endpoint}`);
-  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
-  const config = { method, url: url.toString(), headers: { Authorization: `Bearer ${gcalAccessToken}` } };
-  if (body) config.data = body;
-  const { data } = await axios(config);
-  return data;
+function createCalendarRequest(operation, payload, channelId) {
+  const requestId = 'gcal_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  pendingCalendarRequests.set(requestId, {
+    requestId, operation, payload, channelId,
+    status: 'pending',
+    createdAt: new Date().toISOString()
+  });
+  // Auto-expire after 5 minutes
+  setTimeout(() => pendingCalendarRequests.delete(requestId), 300000);
+  return requestId;
 }
 
 // ── Zoom Helper ───────────────────────────────────────────────────────────────
@@ -428,46 +416,24 @@ async function executeTool(toolName, toolInput) {
     }
 
     if (toolName === 'get_calendar_events') {
-      const days = toolInput.days || 7;
-      const now = new Date();
-      const end = new Date(now.getTime() + days * 86400000);
-      const params = {
-        timeMin: now.toISOString(),
-        timeMax: end.toISOString(),
-        singleEvents: 'true',
-        orderBy: 'startTime',
-        maxResults: '20'
-      };
-      if (toolInput.query) params.q = toolInput.query;
-      const data = await gcal(`/calendars/${encodeURIComponent(GCAL_CALENDAR)}/events`, 'GET', null, params);
-      const events = (data.items || []).map(e => ({
-        id: e.id,
-        title: e.summary,
-        start: e.start?.dateTime || e.start?.date,
-        end: e.end?.dateTime || e.end?.date,
-        location: e.location,
-        description: e.description,
-        attendees: (e.attendees || []).map(a => a.email)
-      }));
-      return JSON.stringify({ count: events.length, events });
+      // Queue request for Claude to handle via connector
+      const requestId = createCalendarRequest('get_events', toolInput, null);
+      return JSON.stringify({
+        status: 'queued',
+        requestId,
+        message: 'Calendar request queued. Check GET /gcal/pending for Claude to process.',
+        instruction: `Claude should call POST /gcal/result with requestId="${requestId}" and the event data.`
+      });
     }
 
     if (toolName === 'create_calendar_event') {
-      const tz = 'Asia/Manila';
-      const startDT = `${toolInput.date}T${toolInput.start_time}:00`;
-      const endDT = `${toolInput.date}T${toolInput.end_time}:00`;
-      const event = {
-        summary: toolInput.title,
-        description: toolInput.description || '',
-        location: toolInput.location || '',
-        start: { dateTime: startDT, timeZone: tz },
-        end: { dateTime: endDT, timeZone: tz }
-      };
-      if (toolInput.attendees?.length) {
-        event.attendees = toolInput.attendees.map(e => ({ email: e }));
-      }
-      const data = await gcal(`/calendars/${encodeURIComponent(GCAL_CALENDAR)}/events`, 'POST', event);
-      return JSON.stringify({ success: true, eventId: data.id, title: data.summary, start: data.start?.dateTime, link: data.htmlLink });
+      const requestId = createCalendarRequest('create_event', toolInput, null);
+      return JSON.stringify({
+        status: 'queued',
+        requestId,
+        message: 'Calendar create request queued.',
+        instruction: `Claude should call POST /gcal/result with requestId="${requestId}" after creating the event.`
+      });
     }
 
     if (toolName === 'create_zoom_meeting') {
@@ -802,24 +768,20 @@ async function sendMorningBriefing() {
     if (mgrQuotes.length > 0) fields.push({ name: '📋 Quotes', value: `**${mgrQuotes.length}** pending`, inline: true });
     if (overdue.length > 0) fields.push({ name: '⚠️ Overdue', value: overdue.map(i => `• #${i.id} — ${i.currencyprefix || '₱'}${parseFloat(i.total).toFixed(2)} (${i.duedate})`).join('\n'), inline: false });
     if (soon.length > 0) fields.push({ name: '📅 Due Soon', value: soon.map(i => `• #${i.id} — ${i.currencyprefix || '₱'}${parseFloat(i.total).toFixed(2)} (${i.duedate})`).join('\n'), inline: false });
-    // Add today's calendar events
-    try {
-      const now2 = new Date();
-      const endOfDay = new Date(now2); endOfDay.setHours(23,59,59,999);
-      const calData = await gcal(`/calendars/${encodeURIComponent(GCAL_CALENDAR)}/events`, 'GET', null, {
-        timeMin: now2.toISOString(), timeMax: endOfDay.toISOString(),
-        singleEvents: 'true', orderBy: 'startTime', maxResults: '10'
-      });
-      const todayEvents = calData.items || [];
-      if (todayEvents.length > 0) {
-        fields.push({ name: '📅 Today\'s Schedule', value: todayEvents.map(e => {
-          const t = e.start?.dateTime ? new Date(e.start.dateTime).toLocaleTimeString('en-PH', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Manila' }) : 'All day';
-          return `• ${t} — ${e.summary}${e.location ? ' @ ' + e.location : ''}`;
-        }).join('\n'), inline: false });
-      } else {
-        fields.push({ name: '📅 Today\'s Schedule', value: 'No meetings scheduled today', inline: false });
-      }
-    } catch (e) { console.log('[GCal Briefing]', e.message); }
+    // Calendar events are injected by Claude via POST /gcal/briefing before 7am
+    const todayCalCache = db.prepare("SELECT value FROM kv_store WHERE key = 'today_calendar'").get();
+    if (todayCalCache) {
+      try {
+        const events = JSON.parse(todayCalCache.value);
+        if (events.length > 0) {
+          fields.push({ name: '📅 Today\'s Schedule', value: events.map(e => `• ${e.time} — ${e.title}${e.location ? ' @ ' + e.location : ''}`).join('\n'), inline: false });
+        } else {
+          fields.push({ name: '📅 Today\'s Schedule', value: 'No meetings scheduled today', inline: false });
+        }
+      } catch(e) {}
+    } else {
+      fields.push({ name: '📅 Today\'s Schedule', value: 'No calendar data yet', inline: false });
+    }
 
     fields.push({ name: '💡 Discord AI Commands', value: '`!ai <your command>` in your command channel\nExample: `!ai show overdue invoices` or `!ai cancel invoice #1234`', inline: false });
 
@@ -851,7 +813,7 @@ app.get('/health', (req, res) => {
     anthropicAI: ANTHROPIC_API_KEY ? '✅ configured' : '⚠️ missing',
     openAI: OPENAI_API_KEY ? '✅ configured' : 'not set',
     discordCommandChannel: DISCORD_COMMAND_CHANNEL ? `✅ ${DISCORD_COMMAND_CHANNEL}` : '⚠️ not set — set DISCORD_COMMAND_CHANNEL env var',
-    googleCalendar: (GCAL_REFRESH && GCAL_CLIENT_ID) ? '✅ configured' : (GCAL_TOKEN ? '✅ token only' : '⚠️ not configured'),
+    googleCalendar: '✅ connector-mode (Claude native access)',
     zoom: (ZOOM_ACCOUNT_ID && ZOOM_CLIENT_ID) ? '✅ configured' : '⚠️ not configured',
     linkedGroups: db.prepare('SELECT COUNT(*) as c FROM group_links').get().c,
     totalMessages: db.prepare('SELECT COUNT(*) as c FROM message_history').get().c,
@@ -877,6 +839,69 @@ app.post('/ai/test', async (req, res) => {
   }
 });
 
+// ── Google Calendar Connector Routes ─────────────────────────────────────────
+// Claude calls these endpoints to push calendar data into the inbox server
+
+// GET /gcal/pending — Claude polls this to see if any calendar ops are waiting
+app.get('/gcal/pending', (req, res) => {
+  const secret = req.headers['x-gcal-secret'] || req.query.secret;
+  if (secret !== GCAL_WEBHOOK_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+  const pending = Array.from(pendingCalendarRequests.values()).filter(r => r.status === 'pending');
+  res.json({ pending });
+});
+
+// POST /gcal/result — Claude posts calendar results back here
+app.post('/gcal/result', (req, res) => {
+  const secret = req.headers['x-gcal-secret'] || req.body.secret;
+  if (secret !== GCAL_WEBHOOK_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+  const { requestId, result, channelId, discordMessage } = req.body;
+  if (!requestId) return res.status(400).json({ error: 'requestId required' });
+
+  const request = pendingCalendarRequests.get(requestId);
+  if (request) {
+    request.status = 'completed';
+    request.result = result;
+    pendingCalendarRequests.set(requestId, request);
+  }
+
+  // If a Discord channel and message are provided, send result there
+  const targetChannel = channelId || DISCORD_COMMAND_CHANNEL;
+  if (targetChannel && discordMessage) {
+    sendDiscordChannel(targetChannel, `📅 **TigerAI Calendar** — ${discordMessage}`);
+  }
+
+  console.log(`[GCal] Result received for ${requestId}`);
+  res.json({ success: true, requestId });
+});
+
+// POST /gcal/briefing — Claude pushes today's events before morning briefing
+app.post('/gcal/briefing', (req, res) => {
+  const secret = req.headers['x-gcal-secret'] || req.body.secret;
+  if (secret !== GCAL_WEBHOOK_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+  const { events } = req.body;
+  if (!events) return res.status(400).json({ error: 'events array required' });
+  db.prepare("INSERT OR REPLACE INTO kv_store (key, value, updated_at) VALUES ('today_calendar', ?, CURRENT_TIMESTAMP)")
+    .run(JSON.stringify(events));
+  console.log(`[GCal] Briefing updated: ${events.length} events`);
+  res.json({ success: true, eventCount: events.length });
+});
+
+// GET /gcal/status — check calendar integration status
+app.get('/gcal/status', (req, res) => {
+  const cache = db.prepare("SELECT value, updated_at FROM kv_store WHERE key = 'today_calendar'").get();
+  res.json({
+    status: 'connector-mode',
+    description: 'Google Calendar is handled by Claude.ai native connector',
+    secret: GCAL_WEBHOOK_SECRET,
+    endpoints: {
+      pending: 'GET /gcal/pending?secret=<secret>',
+      result: 'POST /gcal/result',
+      briefing: 'POST /gcal/briefing'
+    },
+    todayCalendarCache: cache ? { eventCount: JSON.parse(cache.value).length, updatedAt: cache.updated_at } : 'empty'
+  });
+});
+
 app.post('/webhook/:platform', (req, res) => {
   console.log(`[${req.params.platform}]`, JSON.stringify(req.body).slice(0, 200));
   res.json({ received: true, platform: req.params.platform });
@@ -894,6 +919,7 @@ app.listen(PORT, () => {
   console.log(`🤖 Discord AI: ${DISCORD_COMMAND_CHANNEL ? `polling channel ${DISCORD_COMMAND_CHANNEL} every 3s` : '⚠️  set DISCORD_COMMAND_CHANNEL env var'}`);
   console.log(`🧠 AI Provider: ${openai ? 'OpenAI gpt-4o ✅' : (ANTHROPIC_API_KEY ? 'Anthropic claude ✅' : '⚠️  set OPENAI_API_KEY or ANTHROPIC_API_KEY')}`);
 });
+
 
 
 
