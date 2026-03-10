@@ -29,10 +29,10 @@ const DISCORD_COMMAND_CHANNEL = process.env.DISCORD_COMMAND_CHANNEL || null;
 const GCAL_CALENDAR     = process.env.GCAL_CALENDAR_ID || 'tigernethost@gmail.com';
 const GCAL_WEBHOOK_SECRET = process.env.GCAL_WEBHOOK_SECRET || 'TNHCalendar2026';
 
-// Zoom (Server-to-Server OAuth)
-const ZOOM_ACCOUNT_ID    = process.env.ZOOM_ACCOUNT_ID    || 'eKCXh0p9S8CF3rdzoumV1A';
-const ZOOM_CLIENT_ID     = process.env.ZOOM_CLIENT_ID     || 'NA1Vn2iHSQ2gL3L8hJI1vA';
-const ZOOM_CLIENT_SECRET = process.env.ZOOM_CLIENT_SECRET || '9jQUsrBexobvfAX0hQPD4K2W1QW0Jz9U';
+// Zoom (Server-to-Server OAuth) — credentials set via environment variables only
+const ZOOM_ACCOUNT_ID    = process.env.ZOOM_ACCOUNT_ID;
+const ZOOM_CLIENT_ID     = process.env.ZOOM_CLIENT_ID;
+const ZOOM_CLIENT_SECRET = process.env.ZOOM_CLIENT_SECRET;
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const USE_OPENAI = !ANTHROPIC_API_KEY || !!OPENAI_API_KEY; // use OpenAI if set
@@ -964,6 +964,7 @@ app.listen(PORT, () => {
   console.log(`🤖 Discord AI: ${DISCORD_COMMAND_CHANNEL ? `polling channel ${DISCORD_COMMAND_CHANNEL} every 3s` : '⚠️  set DISCORD_COMMAND_CHANNEL env var'}`);
   console.log(`🧠 AI Provider: ${openai ? 'OpenAI gpt-4o ✅' : (ANTHROPIC_API_KEY ? 'Anthropic claude ✅' : '⚠️  set OPENAI_API_KEY or ANTHROPIC_API_KEY')}`);
 });
+
 
 
 
