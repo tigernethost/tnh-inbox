@@ -10,12 +10,18 @@ app.use(cors());
 app.use(express.json());
 
 // ── Constants ────────────────────────────────────────────────────────────────
-const DISCORD = 'https://discord.com/api/webhooks/1480032171145171046/unwQrsbszoZC9l35RHfkBrK0B5YDBPihQtxV0aUdCorHyajvxMsBmyalkQeKptUI1c4X';
-const WHMCS_URL = 'https://tigernethost.com/portal/includes/api.php';
-const MGR_URL = 'http://accounting-corpo.tigernethost.com:8080/api2/VElHRVJORVRIT1NUIDIwMjU';
-const TELEGRAM_TOKEN = '8225869241:AAFeO_a1nRFs4rTo_U4kTyjQasT9q8_Lv08';
-const BOT_USERNAME = 'TigerAIAssist_bot';
+const DISCORD_WEBHOOK   = 'https://discord.com/api/webhooks/1480032171145171046/unwQrsbszoZC9l35RHfkBrK0B5YDBPihQtxV0aUdCorHyajvxMsBmyalkQeKptUI1c4X';
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || process.env.DISCORD_BOT_TOKEN;
+const DISCORD_APP_ID    = '1480770715308527748';
+const WHMCS_URL         = 'https://tigernethost.com/portal/includes/api.php';
+const MGR_URL           = 'http://accounting-corpo.tigernethost.com:8080/api2/VElHRVJORVRIT1NUIDIwMjU';
+const TELEGRAM_TOKEN    = '8225869241:AAFeO_a1nRFs4rTo_U4kTyjQasT9q8_Lv08';
+const BOT_USERNAME      = 'TigerAIAssist_bot';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+
+// DISCORD_COMMAND_CHANNEL — set this env var to your Discord channel ID
+// The bot will listen to messages in that channel with prefix !ai or !tiger
+const DISCORD_COMMAND_CHANNEL = process.env.DISCORD_COMMAND_CHANNEL || null;
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
@@ -23,45 +29,36 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 const db = new Database('/tmp/tnh_inbox.db');
 db.exec(`
   CREATE TABLE IF NOT EXISTS group_links (
-    chat_id TEXT PRIMARY KEY,
-    chat_title TEXT,
-    email TEXT,
-    whmcs_client_id TEXT,
-    client_name TEXT,
-    linked_by TEXT,
+    chat_id TEXT PRIMARY KEY, chat_title TEXT, email TEXT,
+    whmcs_client_id TEXT, client_name TEXT, linked_by TEXT,
     linked_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
   CREATE TABLE IF NOT EXISTS pending_actions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id TEXT,
-    action_type TEXT,
-    action_data TEXT,
-    requested_by TEXT,
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT,
+    action_type TEXT, action_data TEXT, requested_by TEXT,
     status TEXT DEFAULT 'awaiting_confirmation',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
   CREATE TABLE IF NOT EXISTS message_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id TEXT,
-    chat_title TEXT,
-    from_name TEXT,
-    from_username TEXT,
-    message TEXT,
-    direction TEXT DEFAULT 'inbound',
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT,
+    chat_title TEXT, from_name TEXT, from_username TEXT,
+    message TEXT, direction TEXT DEFAULT 'inbound',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
   CREATE TABLE IF NOT EXISTS agent_handoffs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id TEXT,
-    client_name TEXT,
-    reason TEXT,
-    status TEXT DEFAULT 'pending',
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT,
+    client_name TEXT, reason TEXT, status TEXT DEFAULT 'pending',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
   CREATE TABLE IF NOT EXISTS conversation_state (
-    chat_id TEXT PRIMARY KEY,
-    mode TEXT DEFAULT 'ai',
+    chat_id TEXT PRIMARY KEY, mode TEXT DEFAULT 'ai',
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS discord_commands (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id TEXT, user_id TEXT, username TEXT,
+    command TEXT, result TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 `);
 
@@ -80,296 +77,359 @@ const whmcs = async (params) => {
   return data;
 };
 
+const mgr = async (endpoint, method = 'GET', body = null) => {
+  const config = {
+    method, url: `${MGR_URL}${endpoint}`, timeout: 10000,
+    auth: { username: 'administrator', password: 'MarkTNH01' }
+  };
+  if (body) config.data = body;
+  const { data } = await axios(config);
+  return data;
+};
+
+const getPHTime = () => new Date().toLocaleTimeString('en-PH', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit' });
+const getPHDate = () => new Date().toLocaleDateString('en-PH', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Asia/Manila' });
+
 const sendTelegram = async (chatId, text, extra = {}) => {
   await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
     chat_id: chatId, text, parse_mode: 'Markdown', ...extra
-  }).catch(e => console.error('Telegram send error:', e.message));
+  }).catch(e => console.log('Telegram error:', e.message));
 };
 
-const notifyDiscord = async (embed) => {
-  await axios.post(DISCORD, { username: 'TigerAI — Telegram', embeds: [embed] })
-    .catch(e => console.log('Discord error:', e.message));
+const sendDiscordWebhook = async (content, embeds = []) => {
+  await axios.post(DISCORD_WEBHOOK, { username: 'TigerAI — Command Center', content, embeds })
+    .catch(e => console.log('Discord webhook error:', e.message));
+};
+
+const sendDiscordChannel = async (channelId, content, embeds = []) => {
+  await axios.post(`https://discord.com/api/v10/channels/${channelId}/messages`,
+    { content, embeds },
+    { headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' } }
+  ).catch(e => console.log('Discord bot send error:', e.response?.data || e.message));
 };
 
 const saveMessage = (chatId, chatTitle, fromName, fromUsername, message, direction = 'inbound') => {
   db.prepare(`INSERT INTO message_history (chat_id, chat_title, from_name, from_username, message, direction)
-    VALUES (?, ?, ?, ?, ?, ?)`).run(String(chatId), chatTitle, fromName, fromUsername, message, direction);
+    VALUES (?, ?, ?, ?, ?, ?)`).run(chatId, chatTitle, fromName, fromUsername, message, direction);
 };
 
 const getGroupLink = (chatId) => db.prepare('SELECT * FROM group_links WHERE chat_id = ?').get(String(chatId));
-const getChatMode = (chatId) => db.prepare('SELECT mode FROM conversation_state WHERE chat_id = ?').get(String(chatId))?.mode || 'ai';
-const setChatMode = (chatId, mode) => db.prepare('INSERT OR REPLACE INTO conversation_state (chat_id, mode, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)').run(String(chatId), mode);
-const getPHTime = () => new Date().toLocaleTimeString('en-PH', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit' });
+const getMode = (chatId) => {
+  const row = db.prepare('SELECT mode FROM conversation_state WHERE chat_id = ?').get(String(chatId));
+  return row ? row.mode : 'ai';
+};
+const setMode = (chatId, mode) => {
+  db.prepare(`INSERT OR REPLACE INTO conversation_state (chat_id, mode, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)`)
+    .run(String(chatId), mode);
+};
 
-// ── Fetch client context for AI ───────────────────────────────────────────
-async function getClientContext(clientId) {
-  try {
-    const [invData, domData] = await Promise.allSettled([
-      whmcs({ action: 'GetInvoices', userid: clientId, status: 'Unpaid', limitnum: '5' }),
-      whmcs({ action: 'GetClientsDomains', clientid: clientId, limitnum: '10' }),
-    ]);
-
-    const invoices = invData.value?.invoices?.invoice || [];
-    const domains = domData.value?.domains?.domain || [];
-
-    let context = '';
-    if (invoices.length > 0) {
-      context += `UNPAID INVOICES:\n` + invoices.map(i =>
-        `- Invoice #${i.id}: ${i.currencyprefix || '₱'}${parseFloat(i.total).toFixed(2)}, Due: ${i.duedate}`
-      ).join('\n') + '\n\n';
-    } else {
-      context += `UNPAID INVOICES: None\n\n`;
-    }
-
-    if (domains.length > 0) {
-      context += `ACTIVE DOMAINS:\n` + domains.map(d =>
-        `- ${d.domainname} (expires: ${d.expirydate}, status: ${d.status})`
-      ).join('\n');
-    } else {
-      context += `ACTIVE DOMAINS: None on record`;
-    }
-
-    return context;
-  } catch (e) {
-    return 'Unable to fetch client data at this time.';
-  }
-}
-
-// ── Get recent conversation history for AI context ───────────────────────
-function getRecentHistory(chatId, limit = 10) {
-  return db.prepare(`
-    SELECT from_name, message, direction, created_at
-    FROM message_history WHERE chat_id = ?
-    ORDER BY created_at DESC LIMIT ?
-  `).all(String(chatId), limit).reverse();
-}
-
-// ── Detect if client wants a human agent ─────────────────────────────────
-function wantsHumanAgent(text) {
-  const triggers = [
-    'agent', 'human', 'person', 'representative', 'rep', 'staff',
-    'support team', 'real person', 'talk to someone', 'speak to someone',
-    'i need help', 'this is wrong', 'frustrated', 'not helpful',
-    'useless', 'escalate', 'manager', 'supervisor',
-    'tao', 'tawo', 'makipag-usap', 'hindi kaya', 'di kaya'
-  ];
-  const lower = text.toLowerCase();
-  return triggers.some(t => lower.includes(t));
-}
-
-// ── Detect if client is confirming a pending action ──────────────────────
-function isConfirmation(text) {
-  const lower = text.toLowerCase().trim();
-  const yes = ['yes', 'yes.', 'confirm', 'proceed', 'go ahead', 'oo', 'sige', 'sure', 'ok', 'okay'];
-  const no = ['no', 'no.', 'cancel', 'stop', 'huwag', 'hindi', 'nope'];
-  if (yes.some(w => lower === w)) return 'yes';
-  if (no.some(w => lower === w)) return 'no';
-  return null;
-}
-
-// ── Handle pending action confirmation ───────────────────────────────────
-async function handleConfirmation(chatId, clientName, confirmed) {
-  const action = db.prepare(`SELECT * FROM pending_actions WHERE chat_id = ? AND status = 'awaiting_confirmation'
-    ORDER BY created_at DESC LIMIT 1`).get(String(chatId));
-  if (!action) return null; // No pending action, let AI handle it
-
-  if (!confirmed) {
-    db.prepare(`UPDATE pending_actions SET status = 'cancelled' WHERE id = ?`).run(action.id);
-    return `No problem! Your request has been cancelled. No changes were made. Is there anything else I can help you with?`;
-  }
-
-  const actionData = JSON.parse(action.action_data);
-  db.prepare(`UPDATE pending_actions SET status = 'confirmed' WHERE id = ?`).run(action.id);
-
-  if (action.action_type === 'domain_purchase') {
-    await notifyDiscord({
-      title: `✅ Domain Purchase CONFIRMED — Please Process`, color: 0x22c55e,
-      description: `**${clientName}** confirmed domain registration.`,
-      fields: [{ name: 'Domain', value: actionData.domainName, inline: true }, { name: 'Action ID', value: `#${action.id}`, inline: true }],
-      footer: { text: `Confirmed · ${getPHTime()} PHT` }
-    });
-    return `Your domain registration request for *${actionData.domainName}* has been submitted! 🎉\n\nOur team will contact you shortly with pricing and next steps. Thank you!`;
-  }
-
-  if (action.action_type === 'remove_invoice_item') {
-    await notifyDiscord({
-      title: `✅ Invoice Item Removal CONFIRMED`, color: 0x22c55e,
-      description: `**${clientName}** confirmed. Macky, please process in WHMCS.`,
-      fields: [
-        { name: 'Invoice', value: `#${actionData.invoiceId}`, inline: true },
-        { name: 'Item', value: actionData.itemDesc, inline: true },
-        { name: 'Amount', value: `₱${actionData.amount}`, inline: true }
-      ],
-      footer: { text: `Confirmed · ${getPHTime()} PHT` }
-    });
-    return `Got it! Your request to remove *${actionData.itemDesc}* from Invoice #${actionData.invoiceId} has been submitted. Our billing team will update your invoice shortly.`;
-  }
-
-  return `Your request has been confirmed and submitted to our team!`;
-}
-
-// ── AI Response Engine ────────────────────────────────────────────────────
-async function getAIResponse(chatId, userMessage, clientName, clientContext, history) {
-  // Build conversation history for Claude
-  const messages = [];
-
-  // Add recent history
-  for (const h of history.slice(-8)) {
-    if (h.direction === 'inbound') {
-      messages.push({ role: 'user', content: h.message });
-    } else if (h.direction === 'outbound' && h.from_name === 'TigerAI Bot') {
-      messages.push({ role: 'assistant', content: h.message });
-    }
-  }
-
-  // Add current message
-  messages.push({ role: 'user', content: userMessage });
-
-  const systemPrompt = `You are a friendly and professional customer support agent for Tigernethost OPC, an IT services company in the Philippines specializing in cloud hosting, domain registration, IT consulting, and software development.
-
-You are chatting with: ${clientName}
-
-THEIR ACCOUNT DATA:
-${clientContext}
-
-YOUR PERSONALITY:
-- Warm, helpful, and professional — like a real human support agent
-- Use natural conversational language, not robotic responses
-- You can use light Filipino phrases (po, salamat, etc.) naturally if appropriate
-- Keep responses concise and clear
-- Never say you are an AI or a bot — act like a human support agent named "Tig" from the Tigernethost team
-
-WHAT YOU CAN HELP WITH:
-- Invoice inquiries and balance checks (you have their data above)
-- Domain expiry and status checks
-- General hosting and IT questions
-- Taking requests for domain purchases or invoice changes
-
-FOR DOMAIN PURCHASES: When a client wants to buy a domain, confirm the domain name and then say you need their confirmation to proceed, ask "Would you like to confirm this request? Please reply YES to proceed or NO to cancel."
-
-FOR INVOICE ITEM REMOVAL: When a client wants to remove an item, confirm the invoice number and item, then ask "Would you like to confirm this removal? Please reply YES to proceed or NO to cancel."
-
-FOR THINGS YOU CAN'T RESOLVE: Be honest that you'll need to escalate to the team, but don't reveal you're an AI. Say something like "Let me flag this for our senior team" or "I'll need to check with our technical team on this one."
-
-IMPORTANT: Keep responses SHORT (2-4 sentences max unless listing data). Be human. Be helpful.`;
-
-  try {
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 500,
-      system: systemPrompt,
-      messages
-    });
-    return response.content[0].text;
-  } catch (e) {
-    console.error('AI error:', e.message);
-    return `Hi ${clientName}! Thanks for reaching out to Tigernethost. Our team has received your message and will get back to you shortly. For urgent concerns, email us at support@tigernethost.com`;
-  }
-}
-
-// ── Human Handoff ─────────────────────────────────────────────────────────
-async function triggerHumanHandoff(chatId, chatTitle, clientName, reason) {
-  setChatMode(chatId, 'agent');
-
-  db.prepare(`INSERT INTO agent_handoffs (chat_id, client_name, reason, status)
-    VALUES (?, ?, ?, 'pending')`).run(String(chatId), clientName, reason);
-
-  // Alert on Discord with full context
-  const recentHistory = getRecentHistory(chatId, 5);
-  const historyText = recentHistory.map(h =>
-    `${h.direction === 'inbound' ? h.from_name : '🤖 Bot'}: ${h.message.slice(0, 80)}`
-  ).join('\n');
-
-  await notifyDiscord({
-    title: `🚨 AGENT NEEDED — ${clientName}`,
-    description: `A client is requesting to speak with a human agent.`,
-    color: 0xff4444,
-    fields: [
-      { name: '👤 Client', value: clientName, inline: true },
-      { name: '💬 Chat', value: chatTitle, inline: true },
-      { name: '🕐 Time', value: `${getPHTime()} PHT`, inline: true },
-      { name: '📝 Reason', value: reason, inline: false },
-      { name: '📜 Recent Conversation', value: `\`\`\`\n${historyText || 'No history'}\n\`\`\``, inline: false },
-    ],
-    footer: { text: `Chat ID: ${chatId} · Agent mode ON — bot is paused` }
-  });
-
-  return `Of course! I'll connect you with one of our team members right away. Please hold on for a moment — someone from our team will be with you shortly. 😊\n\n_(Our team has been notified and will respond as soon as possible.)_`;
-}
-
-// ── Main Message Handler ──────────────────────────────────────────────────
-async function handleClientMessage(chatId, chatTitle, text, from, username, link) {
-  const clientName = link.client_name;
-  const mode = getChatMode(chatId);
-
-  // If in agent mode, just forward to Discord silently
-  if (mode === 'agent') {
-    await notifyDiscord({
-      title: `💬 ${chatTitle} (Agent Mode)`,
-      description: text, color: 0xff9800,
-      fields: [
-        { name: 'From', value: `${from} ${username}`, inline: true },
-        { name: 'Client', value: clientName, inline: true },
-        { name: 'Time', value: `${getPHTime()} PHT`, inline: true }
-      ],
-      footer: { text: `⚠️ Agent mode — bot is paused · Chat ID: ${chatId}` }
-    });
-    return null; // Don't send any bot reply
-  }
-
-  // Check if wants human agent
-  if (wantsHumanAgent(text)) {
-    return await triggerHumanHandoff(chatId, chatTitle, clientName, text);
-  }
-
-  // Check if confirming a pending action
-  const confirmation = isConfirmation(text);
-  if (confirmation) {
-    const confirmResult = await handleConfirmation(chatId, clientName, confirmation === 'yes');
-    if (confirmResult) return confirmResult;
-    // No pending action — fall through to AI
-  }
-
-  // Get client context and history for AI
-  const [clientContext, history] = await Promise.all([
-    getClientContext(link.whmcs_client_id),
-    Promise.resolve(getRecentHistory(chatId, 10))
-  ]);
-
-  // Get AI response
-  const aiReply = await getAIResponse(chatId, text, clientName, clientContext, history);
-
-  // Check if AI response contains a domain purchase or item removal request pattern
-  // Save as pending action if needed
-  const lowerText = text.toLowerCase();
-  if ((lowerText.includes('buy') || lowerText.includes('register') || lowerText.includes('purchase')) && lowerText.includes('domain')) {
-    const domainMatch = text.match(/[\w-]+\.(com|net|org|ph|co\.ph|com\.ph|info|biz|online|site|app)/i);
-    if (domainMatch) {
-      const actionData = JSON.stringify({ domainName: domainMatch[0] });
-      db.prepare(`INSERT INTO pending_actions (chat_id, action_type, action_data, requested_by, status)
-        VALUES (?, 'domain_purchase', ?, ?, 'awaiting_confirmation')`).run(String(chatId), actionData, clientName);
-    }
-  }
-
-  if ((lowerText.includes('remove') || lowerText.includes('delete')) && lowerText.includes('invoice')) {
-    const invoiceMatch = text.match(/#?(\d+)/);
-    if (invoiceMatch) {
-      const itemDesc = text.replace(/remove|delete|from|invoice|#?\d+/gi, '').trim();
-      const invData = await whmcs({ action: 'GetInvoice', invoiceid: invoiceMatch[1] }).catch(() => null);
-      const items = invData?.invoice?.items?.item || [];
-      const item = itemDesc ? items.find(i => i.description?.toLowerCase().includes(itemDesc.toLowerCase())) : items[0];
-      if (item) {
-        const actionData = JSON.stringify({ invoiceId: invoiceMatch[1], itemId: item.id, itemDesc: item.description, amount: item.amount });
-        db.prepare(`INSERT INTO pending_actions (chat_id, action_type, action_data, requested_by, status)
-          VALUES (?, 'remove_invoice_item', ?, ?, 'awaiting_confirmation')`).run(String(chatId), actionData, clientName);
+// ── AI Tools (Functions Claude can call) ─────────────────────────────────────
+const tools = [
+  {
+    name: 'get_whmcs_unpaid_invoices',
+    description: 'Get all unpaid/overdue invoices from WHMCS billing system. Can filter by client.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        client_name: { type: 'string', description: 'Optional: filter by client name or email' },
+        limit: { type: 'number', description: 'Max results (default 20)' }
       }
     }
+  },
+  {
+    name: 'get_whmcs_client',
+    description: 'Look up a WHMCS client by name, email, or ID',
+    input_schema: {
+      type: 'object',
+      properties: {
+        search: { type: 'string', description: 'Name, email, or ID to search' }
+      },
+      required: ['search']
+    }
+  },
+  {
+    name: 'update_whmcs_invoice_status',
+    description: 'Cancel or update a WHMCS invoice status. Use for cancelling old invoices.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        invoice_id: { type: 'string', description: 'WHMCS Invoice ID number' },
+        status: { type: 'string', enum: ['Cancelled', 'Unpaid', 'Paid'], description: 'New status' }
+      },
+      required: ['invoice_id', 'status']
+    }
+  },
+  {
+    name: 'update_whmcs_client_status',
+    description: 'Set a WHMCS client as Active, Inactive, or Closed',
+    input_schema: {
+      type: 'object',
+      properties: {
+        client_id: { type: 'string', description: 'WHMCS Client ID' },
+        status: { type: 'string', enum: ['Active', 'Inactive', 'Closed'] }
+      },
+      required: ['client_id', 'status']
+    }
+  },
+  {
+    name: 'get_manager_invoices',
+    description: 'Get unpaid invoices from Manager.io accounting system',
+    input_schema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Max results' }
+      }
+    }
+  },
+  {
+    name: 'get_manager_quotes',
+    description: 'Get pending sales quotes from Manager.io',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'record_manager_payment',
+    description: 'Record a payment/receipt in Manager.io for a sales invoice. NEVER deletes data.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        invoice_key: { type: 'string', description: 'Manager.io invoice UUID/key' },
+        amount: { type: 'number', description: 'Payment amount' },
+        bank_account_key: { type: 'string', description: 'Bank account key. UB9855 Unionbank = e84f8ad9-738c-4686-919f-f70055b256ad' },
+        description: { type: 'string', description: 'Payment memo/description' }
+      },
+      required: ['invoice_key', 'amount']
+    }
+  },
+  {
+    name: 'get_overdue_summary',
+    description: 'Get a full overdue summary across WHMCS and Manager.io',
+    input_schema: { type: 'object', properties: {} }
   }
+];
 
-  return aiReply;
+// ── Tool Executor ─────────────────────────────────────────────────────────────
+async function executeTool(toolName, toolInput) {
+  console.log(`[Tool] Executing: ${toolName}`, JSON.stringify(toolInput).slice(0, 150));
+  try {
+    if (toolName === 'get_whmcs_unpaid_invoices') {
+      const params = { action: 'GetInvoices', status: 'Unpaid', limitnum: String(toolInput.limit || 20) };
+      if (toolInput.client_name) params.search = toolInput.client_name;
+      const data = await whmcs(params);
+      const invoices = data?.invoices?.invoice || [];
+      return JSON.stringify({
+        count: invoices.length,
+        invoices: invoices.map(i => ({
+          id: i.id, client: i.clientname, amount: i.total,
+          currency: i.currencyprefix || '₱', duedate: i.duedate,
+          overdue: new Date(i.duedate) < new Date()
+        }))
+      });
+    }
+
+    if (toolName === 'get_whmcs_client') {
+      const data = await whmcs({ action: 'GetClients', search: toolInput.search, limitnum: '5' });
+      const clients = data?.clients?.client || [];
+      return JSON.stringify({
+        count: clients.length,
+        clients: clients.map(c => ({
+          id: c.id,
+          name: `${c.firstname} ${c.lastname}`.trim() || c.companyname,
+          email: c.email, status: c.status, company: c.companyname
+        }))
+      });
+    }
+
+    if (toolName === 'update_whmcs_invoice_status') {
+      const data = await whmcs({ action: 'UpdateInvoice', invoiceid: toolInput.invoice_id, status: toolInput.status });
+      return JSON.stringify({ success: data.result === 'success', result: data.result, invoiceid: toolInput.invoice_id, newStatus: toolInput.status });
+    }
+
+    if (toolName === 'update_whmcs_client_status') {
+      const data = await whmcs({ action: 'UpdateClient', clientid: toolInput.client_id, status: toolInput.status });
+      return JSON.stringify({ success: data.result === 'success', result: data.result, clientId: toolInput.client_id, newStatus: toolInput.status });
+    }
+
+    if (toolName === 'get_manager_invoices') {
+      const data = await mgr('/index?model=SalesInvoice');
+      const unpaid = (Array.isArray(data) ? data : []).filter(i => !i.Void && i.AmountDue > 0);
+      const limited = unpaid.slice(0, toolInput.limit || 20);
+      const total = unpaid.reduce((s, i) => s + (i.AmountDue || 0), 0);
+      return JSON.stringify({
+        count: unpaid.length, totalDue: total,
+        invoices: limited.map(i => ({
+          key: i.Key, reference: i.Reference, customer: i.Customer,
+          amountDue: i.AmountDue, date: i.Date
+        }))
+      });
+    }
+
+    if (toolName === 'get_manager_quotes') {
+      const data = await mgr('/index?model=SalesQuote');
+      const pending = (Array.isArray(data) ? data : []).filter(q => q.Status !== 'Converted' && q.Status !== 'Declined');
+      return JSON.stringify({
+        count: pending.length,
+        quotes: pending.map(q => ({ key: q.Key, reference: q.Reference, customer: q.Customer, amount: q.TotalAmount, date: q.Date, status: q.Status }))
+      });
+    }
+
+    if (toolName === 'record_manager_payment') {
+      const bankKey = toolInput.bank_account_key || 'e84f8ad9-738c-4686-919f-f70055b256ad';
+      const payload = {
+        Date: new Date().toISOString().split('T')[0],
+        BankAccount: bankKey,
+        Lines: [{ SalesInvoice: toolInput.invoice_key, Amount: toolInput.amount }],
+        Description: toolInput.description || 'Payment received'
+      };
+      const data = await mgr('/index?model=Receipt', 'POST', payload);
+      return JSON.stringify({ success: true, receipt: data });
+    }
+
+    if (toolName === 'get_overdue_summary') {
+      const data = await whmcs({ action: 'GetInvoices', status: 'Unpaid', limitnum: '200' });
+      const all = data?.invoices?.invoice || [];
+      const overdue = all.filter(i => new Date(i.duedate) < new Date());
+      const byClient = {};
+      overdue.forEach(i => {
+        if (!byClient[i.clientname]) byClient[i.clientname] = { count: 0, total: 0, oldest: i.duedate };
+        byClient[i.clientname].count++;
+        byClient[i.clientname].total += parseFloat(i.total);
+      });
+      let mgrTotal = 0, mgrCount = 0;
+      try {
+        const mr = await mgr('/index?model=SalesInvoice');
+        const unpaid = (Array.isArray(mr) ? mr : []).filter(i => !i.Void && i.AmountDue > 0);
+        mgrTotal = unpaid.reduce((s, i) => s + (i.AmountDue || 0), 0);
+        mgrCount = unpaid.length;
+      } catch (e) {}
+      return JSON.stringify({ whmcsOverdue: overdue.length, whmcsTotal: overdue.reduce((s, i) => s + parseFloat(i.total), 0), byClient, managerIoUnpaid: mgrCount, managerIoTotal: mgrTotal });
+    }
+
+    return JSON.stringify({ error: `Unknown tool: ${toolName}` });
+  } catch (err) {
+    console.error(`[Tool Error] ${toolName}:`, err.message);
+    return JSON.stringify({ error: err.message });
+  }
 }
 
-// ── Telegram Webhook ─────────────────────────────────────────────────────────
+// ── AI Brain ──────────────────────────────────────────────────────────────────
+async function processAICommand(userMessage, username) {
+  console.log(`[AI] ${username}: ${userMessage.slice(0, 100)}`);
+
+  const systemPrompt = `You are TigerAI, the AI executive assistant for Tigernethost OPC, an IT services company in Guagua, Pampanga, Philippines. You are talking to Macky, the owner.
+
+You have access to WHMCS (billing) and Manager.io (accounting). You can:
+- Check and update invoices, clients, domains
+- Look up overdue and unpaid invoices
+- Record payments in Manager.io
+- Cancel old invoices in WHMCS
+
+Current time: ${getPHDate()} ${getPHTime()} PHT
+
+Rules:
+- Be concise and direct — this is a command interface
+- Format PHP amounts with ₱ symbol
+- NEVER delete data in Manager.io — only read, create, update
+- When you complete an action, confirm clearly what was done
+- If a task has multiple steps, complete them all before summarizing
+- Keep responses under 1500 characters for Discord readability`;
+
+  const messages = [{ role: 'user', content: userMessage }];
+
+  let response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 1024,
+    system: systemPrompt,
+    tools,
+    messages
+  });
+
+  // Agentic loop
+  while (response.stop_reason === 'tool_use') {
+    const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+    const toolResults = [];
+    for (const toolUse of toolUseBlocks) {
+      const result = await executeTool(toolUse.name, toolUse.input);
+      toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: result });
+    }
+    messages.push({ role: 'assistant', content: response.content });
+    messages.push({ role: 'user', content: toolResults });
+    response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      system: systemPrompt,
+      tools,
+      messages
+    });
+  }
+
+  const textBlock = response.content.find(b => b.type === 'text');
+  return textBlock ? textBlock.text : 'Done.';
+}
+
+// ── Discord Bot Message Polling ───────────────────────────────────────────────
+let lastDiscordMessageId = null;
+let discordPollingActive = false;
+
+async function pollDiscordMessages() {
+  if (!DISCORD_COMMAND_CHANNEL || !DISCORD_BOT_TOKEN) return;
+  if (discordPollingActive) return;
+  discordPollingActive = true;
+
+  try {
+    const params = lastDiscordMessageId ? `?after=${lastDiscordMessageId}&limit=10` : `?limit=5`;
+    const { data: messages } = await axios.get(
+      `https://discord.com/api/v10/channels/${DISCORD_COMMAND_CHANNEL}/messages${params}`,
+      { headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` } }
+    );
+
+    if (!messages || messages.length === 0) return;
+    lastDiscordMessageId = messages[0].id;
+
+    // Process oldest first, skip bots, require !ai or !tiger prefix
+    const toProcess = [...messages].reverse().filter(m =>
+      !m.author?.bot &&
+      (m.content?.toLowerCase().startsWith('!ai ') || m.content?.toLowerCase().startsWith('!tiger '))
+    );
+
+    for (const msg of toProcess) {
+      const command = msg.content.replace(/^!(ai|tiger)\s+/i, '').trim();
+      if (!command) continue;
+      console.log(`[Discord Bot] ${msg.author.username}: ${command}`);
+
+      // Typing indicator
+      await axios.post(
+        `https://discord.com/api/v10/channels/${DISCORD_COMMAND_CHANNEL}/typing`, {},
+        { headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` } }
+      ).catch(() => {});
+
+      const result = await processAICommand(command, msg.author.username);
+
+      db.prepare(`INSERT INTO discord_commands (channel_id, user_id, username, command, result) VALUES (?, ?, ?, ?, ?)`)
+        .run(DISCORD_COMMAND_CHANNEL, msg.author.id, msg.author.username, command, result);
+
+      // Reply in channel — mention the user
+      await sendDiscordChannel(
+        DISCORD_COMMAND_CHANNEL,
+        `<@${msg.author.id}> 🤖 **TigerAI** — \`${command}\`\n\n${result}`
+      );
+    }
+  } catch (err) {
+    if (err.response?.status === 403) {
+      console.log('[Discord] Bot lacks permission to read channel. Make sure bot is in server and has access.');
+    } else if (err.response?.status === 401) {
+      console.log('[Discord] Invalid bot token.');
+    } else {
+      console.error('[Discord Poll Error]', err.message);
+    }
+  } finally {
+    discordPollingActive = false;
+  }
+}
+
+// Poll every 3 seconds
+setInterval(pollDiscordMessages, 3000);
+
+// ── Telegram Webhook ──────────────────────────────────────────────────────────
 app.post('/webhook/telegram', async (req, res) => {
   res.json({ ok: true });
   try {
@@ -386,7 +446,6 @@ app.post('/webhook/telegram', async (req, res) => {
     const botMentioned = text.includes(`@${BOT_USERNAME}`);
     const isCommand = text.startsWith('/');
 
-    // Groups: silent unless tagged or command
     if (isGroup && !botMentioned && !isCommand) {
       saveMessage(chatId, chatTitle, from, username, text, 'inbound');
       return;
@@ -395,197 +454,169 @@ app.post('/webhook/telegram', async (req, res) => {
     const cleanText = text.replace(`@${BOT_USERNAME}`, '').trim();
     saveMessage(chatId, chatTitle, from, username, cleanText, 'inbound');
 
-    // ── Admin Commands ─────────────────────────────────────────
     if (cleanText.startsWith('/link ')) {
       const email = cleanText.replace('/link', '').trim();
       if (!email.includes('@')) { await sendTelegram(chatId, `❌ Usage: /link client@email.com`); return; }
       const result = await whmcs({ action: 'GetClients', search: email, limitnum: '1' });
       const client = result?.clients?.client?.[0];
-      if (!client) { await sendTelegram(chatId, `❌ No client found with email *${email}* in WHMCS.`); return; }
+      if (!client) { await sendTelegram(chatId, `❌ No client found with email *${email}*`); return; }
       const clientName = `${client.firstname} ${client.lastname}`.trim() || client.companyname || email;
-      db.prepare(`INSERT OR REPLACE INTO group_links (chat_id, chat_title, email, whmcs_client_id, client_name, linked_by)
-        VALUES (?, ?, ?, ?, ?, ?)`).run(chatId, chatTitle, email, String(client.id), clientName, `${from} ${username}`);
-      setChatMode(chatId, 'ai');
-      await sendTelegram(chatId, `✅ *Group linked!*\n\n👤 *${clientName}*\n📧 ${email}\n🆔 WHMCS #${client.id}\n\nAI assistant is now active for this group.`);
-      await notifyDiscord({ title: `🔗 Group Linked`, color: 0x22c55e, fields: [{ name: 'Group', value: chatTitle, inline: true }, { name: 'Client', value: clientName, inline: true }, { name: 'Email', value: email, inline: true }], footer: { text: `Linked by ${from} · ${getPHTime()} PHT` } });
+      db.prepare(`INSERT OR REPLACE INTO group_links (chat_id, chat_title, email, whmcs_client_id, client_name, linked_by) VALUES (?, ?, ?, ?, ?, ?)`)
+        .run(chatId, chatTitle, email, String(client.id), clientName, `${from} ${username}`);
+      await sendTelegram(chatId, `✅ *Linked!*\n\n👤 *${clientName}*\n📧 ${email}\n🆔 WHMCS #${client.id}`);
       return;
     }
 
-    if (cleanText === '/unlink') {
-      db.prepare('DELETE FROM group_links WHERE chat_id = ?').run(chatId);
-      db.prepare('DELETE FROM conversation_state WHERE chat_id = ?').run(chatId);
-      await sendTelegram(chatId, `✅ Group unlinked.`); return;
-    }
-
+    if (cleanText === '/unlink') { db.prepare('DELETE FROM group_links WHERE chat_id = ?').run(chatId); await sendTelegram(chatId, `✅ Unlinked.`); return; }
+    if (cleanText === '/resumeai' || cleanText === '/ai') { setMode(chatId, 'ai'); await sendTelegram(chatId, `✅ AI mode resumed.`); return; }
     if (cleanText === '/status') {
       const link = getGroupLink(chatId);
-      const mode = getChatMode(chatId);
-      if (link) await sendTelegram(chatId, `🔗 *${link.client_name}*\n📧 ${link.email}\n🤖 Mode: *${mode === 'agent' ? '👤 Agent (bot paused)' : '🤖 AI Active'}*`);
+      const mode = getMode(chatId);
+      if (link) await sendTelegram(chatId, `🔗 *${link.client_name}*\n📧 ${link.email}\n🆔 WHMCS #${link.whmcs_client_id}\n🤖 Mode: *${mode.toUpperCase()}*`);
       else await sendTelegram(chatId, `❌ Not linked. Use: /link client@email.com`);
       return;
     }
 
-    // Resume AI mode (agent command)
-    if (cleanText === '/resumeai' || cleanText === '/ai') {
-      setChatMode(chatId, 'ai');
-      await sendTelegram(chatId, `🤖 AI assistant is back online!`);
-      await notifyDiscord({ title: `🤖 AI Mode Resumed`, color: 0x22c55e, fields: [{ name: 'Chat', value: chatTitle, inline: true }], footer: { text: getPHTime() + ' PHT' } });
-      return;
-    }
-
-    if (cleanText === '/history') {
-      const rows = getRecentHistory(chatId, 10);
-      if (!rows.length) { await sendTelegram(chatId, `No history yet.`); return; }
-      const list = rows.map(r => `[${r.created_at.slice(11, 16)}] ${r.direction === 'inbound' ? r.from_name : '🤖'}: ${r.message.slice(0, 50)}`).join('\n');
-      await sendTelegram(chatId, `📜 *Recent History:*\n\`\`\`\n${list}\n\`\`\``);
-      return;
-    }
-
-    if (cleanText === '/help' || cleanText === '/start') {
-      const link = getGroupLink(chatId);
-      if (link) {
-        await sendTelegram(chatId, `👋 Hi! How can I help you today?\n\nYou can ask me about:\n• Your invoices and balance\n• Your domains\n• Buying a new domain\n• Removing an item from an invoice\n• Any support concerns\n\nJust type your question! 😊`);
-      } else {
-        await sendTelegram(chatId, `👋 Hi! I'm from the Tigernethost support team.\n\n📧 support@tigernethost.com\n🌐 tigernethost.com`);
-      }
-      return;
-    }
-
-    // ── Client Messages ────────────────────────────────────────
+    const mode = getMode(chatId);
     const link = getGroupLink(chatId);
+
     if (!link) {
-      await sendTelegram(chatId, `👋 Hi ${from}! Thanks for reaching out to Tigernethost.\n\n📧 support@tigernethost.com\n🌐 tigernethost.com`);
+      await sendTelegram(chatId, `👋 Hi ${from}! I'm *TigerAI* from *Tigernethost OPC*.\n\n📧 support@tigernethost.com\n🌐 tigernethost.com`);
       return;
     }
 
-    // Forward all messages to Discord
-    const mode = getChatMode(chatId);
-    await notifyDiscord({
-      title: isGroup ? `💬 ${chatTitle}` : `📨 DM — ${from}`,
-      description: cleanText,
-      color: mode === 'agent' ? 0xff9800 : 0x229ED9,
-      fields: [
-        { name: 'From', value: `${from} ${username}`, inline: true },
-        { name: 'Client', value: link.client_name, inline: true },
-        { name: 'Mode', value: mode === 'agent' ? '👤 Agent' : '🤖 AI', inline: true }
-      ],
-      footer: { text: `${getPHTime()} PHT · @${BOT_USERNAME}` }
-    });
+    if (mode === 'agent') return; // Human handling, bot silent
 
-    // Process message
-    const reply = await handleClientMessage(chatId, chatTitle, cleanText, from, username, link);
+    try {
+      const aiReply = await processAICommand(
+        `Client ${link.client_name} (WHMCS #${link.whmcs_client_id}) says: ${cleanText}`,
+        from
+      );
+      await sendTelegram(chatId, aiReply);
+      saveMessage(chatId, chatTitle, 'TigerAI', BOT_USERNAME, aiReply, 'outbound');
 
-    if (reply) {
-      await sendTelegram(chatId, reply);
-      saveMessage(chatId, chatTitle, 'TigerAI Bot', BOT_USERNAME, reply, 'outbound');
+      const lower = cleanText.toLowerCase();
+      if (lower.includes('human') || lower.includes('agent') || lower.includes('tao') || lower.includes('frustrated')) {
+        setMode(chatId, 'agent');
+        db.prepare(`INSERT INTO agent_handoffs (chat_id, client_name, reason, status) VALUES (?, ?, ?, 'pending')`)
+          .run(chatId, link.client_name, cleanText);
+        await sendTelegram(chatId, `🙋 Connecting you to a human agent. Please wait...`);
+        await sendDiscordWebhook(null, [{
+          title: `🚨 Agent Handoff — ${link.client_name}`,
+          description: `Client is requesting a human agent.`,
+          color: 0xff4d4d,
+          fields: [
+            { name: 'Message', value: cleanText, inline: false },
+            { name: 'Client', value: link.client_name, inline: true },
+            { name: 'WHMCS', value: `#${link.whmcs_client_id}`, inline: true },
+            { name: 'Resume', value: 'Send `/resumeai` in the group', inline: false }
+          ],
+          footer: { text: `${getPHTime()} PHT` }
+        }]);
+      }
+    } catch (err) {
+      console.error('[Telegram AI Error]', err.message);
+      await sendTelegram(chatId, `Sorry, I had trouble with that. Please try again or contact support@tigernethost.com`);
     }
-
   } catch (err) {
-    console.error('[Telegram] Error:', err.message);
+    console.error('[Telegram Webhook Error]', err.message);
   }
 });
 
-// ── Morning Briefing ─────────────────────────────────────────────────────────
-// ── Fetch Google Calendar events for today ───────────────────────────────
-async function getTodayCalendarEvents() {
-  try {
-    const GCAL_CALENDAR_ID = process.env.GCAL_CALENDAR_ID || 'tigernethost@gmail.com';
-    const GCAL_API_KEY = process.env.GCAL_API_KEY;
-    const GCAL_TOKEN = process.env.GCAL_TOKEN;
-    if (!GCAL_TOKEN && !GCAL_API_KEY) return [];
-
-    const now = new Date();
-    const manilaOffset = 8 * 60;
-    const utcMs = now.getTime() + (now.getTimezoneOffset() * 60000);
-    const manilaDate = new Date(utcMs + manilaOffset * 60000);
-    const todayStart = new Date(manilaDate); todayStart.setHours(0,0,0,0);
-    const todayEnd = new Date(manilaDate); todayEnd.setHours(23,59,59,999);
-
-    const toISO = (d) => new Date(d.getTime() - manilaOffset * 60000).toISOString();
-
-    const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(GCAL_CALENDAR_ID)}/events?timeMin=${toISO(todayStart)}&timeMax=${toISO(todayEnd)}&singleEvents=true&orderBy=startTime`;
-    const headers = GCAL_TOKEN ? { Authorization: `Bearer ${GCAL_TOKEN}` } : {};
-
-    const resp = await axios.get(url, { headers, timeout: 8000 });
-    return resp.data.items || [];
-  } catch (e) {
-    console.log('Google Calendar fetch error:', e.message);
-    return [];
-  }
-}
-
+// ── Morning Briefing ──────────────────────────────────────────────────────────
 async function sendMorningBriefing() {
   const now = new Date();
-  const dateStr = now.toLocaleDateString('en-PH', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Asia/Manila' });
-  const timeStr = now.toLocaleTimeString('en-PH', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Manila' });
+  const timeStr = getPHTime();
   try {
     const inv = await whmcs({ action: 'GetInvoices', status: 'Unpaid', limitnum: '200' });
     const allInv = inv?.invoices?.invoice || [];
     const overdue = allInv.filter(i => new Date(i.duedate) < now).slice(0, 5);
     const soon = allInv.filter(i => { const d = new Date(i.duedate); return d >= now && d <= new Date(now.getTime() + 30 * 86400000); }).slice(0, 5);
+
     let mgrUnpaid = [], mgrTotal = 0, mgrQuotes = [];
     try {
-      const mr = await axios.get(`${MGR_URL}/index?model=SalesInvoice`, { timeout: 8000 });
-      mgrUnpaid = (mr.data || []).filter(i => !i.Void && i.AmountDue > 0);
+      const mr = await mgr('/index?model=SalesInvoice');
+      mgrUnpaid = (Array.isArray(mr) ? mr : []).filter(i => !i.Void && i.AmountDue > 0);
       mgrTotal = mgrUnpaid.reduce((s, i) => s + (i.AmountDue || 0), 0);
-      const qr = await axios.get(`${MGR_URL}/index?model=SalesQuote`, { timeout: 8000 });
-      mgrQuotes = (qr.data || []).filter(q => q.Status !== 'Converted' && q.Status !== 'Declined');
+      const qr = await mgr('/index?model=SalesQuote');
+      mgrQuotes = (Array.isArray(qr) ? qr : []).filter(q => q.Status !== 'Converted' && q.Status !== 'Declined');
     } catch (e) { console.log('Manager.io:', e.message); }
 
-    // Fetch today's calendar events
-    const calEvents = await getTodayCalendarEvents();
-
-    const linkedGroups = db.prepare('SELECT COUNT(*) as c FROM group_links').get().c;
-    const pendingHandoffs = db.prepare("SELECT COUNT(*) as c FROM agent_handoffs WHERE status='pending'").get().c;
-
+    const linkedGroups = db.prepare('SELECT COUNT(*) as count FROM group_links').get();
     const fields = [
       { name: '📊 WHMCS', value: `Unpaid: **${allInv.length}**\nDue soon: **${soon.length}**`, inline: true },
       { name: '🧾 Manager.io', value: `Invoices: **${mgrUnpaid.length}**\nTotal: **₱${mgrTotal.toLocaleString('en-PH')}**`, inline: true },
-      { name: '🤖 Bot', value: `Linked GCs: **${linkedGroups}**\n⚠️ Pending handoffs: **${pendingHandoffs}**`, inline: true },
+      { name: '🤖 Telegram Bot', value: `Linked GCs: **${linkedGroups.count}**`, inline: true },
     ];
-
-    // Add today's schedule
-    if (calEvents.length > 0) {
-      const scheduleText = calEvents.map(e => {
-        const start = e.start?.dateTime ? new Date(e.start.dateTime).toLocaleTimeString('en-PH', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Manila' }) : 'All Day';
-        const loc = e.location ? ` 📍 ${e.location}` : '';
-        return `• **${start}** — ${e.summary}${loc}`;
-      }).join('\n');
-      fields.unshift({ name: `📅 Today's Schedule (${calEvents.length} event${calEvents.length > 1 ? 's' : ''})`, value: scheduleText, inline: false });
-    } else {
-      fields.unshift({ name: '📅 Today\'s Schedule', value: '_No meetings scheduled today_', inline: false });
-    }
-
     if (mgrQuotes.length > 0) fields.push({ name: '📋 Quotes', value: `**${mgrQuotes.length}** pending`, inline: true });
     if (overdue.length > 0) fields.push({ name: '⚠️ Overdue', value: overdue.map(i => `• #${i.id} — ${i.currencyprefix || '₱'}${parseFloat(i.total).toFixed(2)} (${i.duedate})`).join('\n'), inline: false });
     if (soon.length > 0) fields.push({ name: '📅 Due Soon', value: soon.map(i => `• #${i.id} — ${i.currencyprefix || '₱'}${parseFloat(i.total).toFixed(2)} (${i.duedate})`).join('\n'), inline: false });
+    fields.push({ name: '💡 Discord AI Commands', value: '`!ai <your command>` in your command channel\nExample: `!ai show overdue invoices` or `!ai cancel invoice #1234`', inline: false });
 
-    await axios.post(DISCORD, { username: 'Claude AI — TNH Morning Briefing', embeds: [{ title: `☀️ Good Morning, Macky! — ${dateStr}`, description: 'Daily briefing for **Tigernethost OPC**.', color: 0xf7c948, fields, footer: { text: `inbox.tigernethost.com · ${timeStr} PHT · Node ${process.version}` } }] });
-    console.log(`✅ Briefing sent at ${timeStr}`);
-    return { success: true, whmcsUnpaid: allInv.length, mgrTotal, overdueCount: overdue.length, calendarEvents: calEvents.length };
-  } catch (err) { return { success: false, error: err.message }; }
+    await axios.post(DISCORD_WEBHOOK, {
+      username: 'Claude AI — TNH Morning Briefing',
+      embeds: [{ title: `☀️ Good Morning, Macky! — ${getPHDate()}`, description: 'Daily briefing for **Tigernethost OPC**.', color: 0xf7c948, fields, footer: { text: `inbox.tigernethost.com • ${timeStr} PHT • Node ${process.version}` } }]
+    });
+
+    console.log(`✅ Morning briefing sent at ${timeStr}`);
+    return { success: true, whmcsUnpaid: allInv.length, mgrTotal, overdueCount: overdue.length };
+  } catch (err) {
+    console.error('❌ Briefing error:', err.message);
+    return { success: false, error: err.message };
+  }
 }
 
 cron.schedule('0 7 * * *', () => sendMorningBriefing(), { timezone: 'Asia/Manila' });
 
-// ── Routes ───────────────────────────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({
-  status: 'ok', service: 'inbox.tigernethost.com', nodeVersion: process.version,
-  time: new Date().toISOString(), nextBriefing: '7:00 AM PHT daily',
-  linkedGroups: db.prepare('SELECT COUNT(*) as c FROM group_links').get().c,
-  totalMessages: db.prepare('SELECT COUNT(*) as c FROM message_history').get().c,
-  pendingHandoffs: db.prepare("SELECT COUNT(*) as c FROM agent_handoffs WHERE status='pending'").get().c
-}));
+// ── Routes ────────────────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'inbox.tigernethost.com',
+    nodeVersion: process.version,
+    time: new Date().toISOString(),
+    nextBriefing: '7:00 AM PHT daily',
+    discordBot: DISCORD_BOT_TOKEN ? '✅ configured' : '❌ missing',
+    anthropicAI: ANTHROPIC_API_KEY ? '✅ configured' : '⚠️ missing — set ANTHROPIC_API_KEY',
+    discordCommandChannel: DISCORD_COMMAND_CHANNEL ? `✅ ${DISCORD_COMMAND_CHANNEL}` : '⚠️ not set — set DISCORD_COMMAND_CHANNEL env var',
+    linkedGroups: db.prepare('SELECT COUNT(*) as c FROM group_links').get().c,
+    totalMessages: db.prepare('SELECT COUNT(*) as c FROM message_history').get().c,
+    discordCommandsRun: db.prepare('SELECT COUNT(*) as c FROM discord_commands').get().c,
+  });
+});
+
 app.get('/briefing/send', async (req, res) => res.json(await sendMorningBriefing()));
 app.get('/groups', (req, res) => res.json({ groups: db.prepare('SELECT * FROM group_links ORDER BY linked_at DESC').all() }));
 app.get('/history/:chatId', (req, res) => res.json({ messages: db.prepare('SELECT * FROM message_history WHERE chat_id = ? ORDER BY created_at DESC LIMIT 50').all(req.params.chatId) }));
-app.get('/handoffs', (req, res) => res.json({ handoffs: db.prepare("SELECT * FROM agent_handoffs ORDER BY created_at DESC LIMIT 20").all() }));
-app.post('/webhook/:platform', (req, res) => { console.log(`[${req.params.platform}]`, JSON.stringify(req.body).slice(0, 200)); res.json({ received: true }); });
-app.get('/webhook/:platform', (req, res) => { const { 'hub.challenge': c, 'hub.mode': m } = req.query; if (m === 'subscribe' && c) return res.send(c); res.json({ status: 'ready' }); });
+app.get('/discord/commands', (req, res) => res.json({ commands: db.prepare('SELECT * FROM discord_commands ORDER BY created_at DESC LIMIT 50').all() }));
+app.get('/handoffs', (req, res) => res.json({ handoffs: db.prepare('SELECT * FROM agent_handoffs ORDER BY created_at DESC LIMIT 20').all() }));
+
+// Manual AI test endpoint
+app.post('/ai/test', async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'message required' });
+  try {
+    const result = await processAICommand(message, 'API Test');
+    res.json({ result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/webhook/:platform', (req, res) => {
+  console.log(`[${req.params.platform}]`, JSON.stringify(req.body).slice(0, 200));
+  res.json({ received: true, platform: req.params.platform });
+});
+app.get('/webhook/:platform', (req, res) => {
+  const { 'hub.challenge': c, 'hub.mode': m } = req.query;
+  if (m === 'subscribe' && c) return res.send(c);
+  res.json({ platform: req.params.platform, status: 'ready' });
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`✅ inbox.tigernethost.com on port ${PORT} · Node ${process.version}`);
-  console.log(`🤖 AI-powered by Claude · ${ANTHROPIC_API_KEY ? 'API key loaded' : '⚠️ No API key'}`);
+  console.log(`✅ inbox.tigernethost.com on port ${PORT} • Node ${process.version}`);
   console.log(`⏰ Morning briefing: 7:00 AM PHT daily`);
+  console.log(`🤖 Discord AI: ${DISCORD_COMMAND_CHANNEL ? `polling channel ${DISCORD_COMMAND_CHANNEL} every 3s` : '⚠️  set DISCORD_COMMAND_CHANNEL env var'}`);
+  console.log(`🧠 Anthropic AI: ${ANTHROPIC_API_KEY ? 'ready' : '⚠️  set ANTHROPIC_API_KEY env var'}`);
 });
