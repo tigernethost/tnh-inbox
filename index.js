@@ -4,6 +4,7 @@ const axios = require('axios');
 const cors = require('cors');
 const Database = require('better-sqlite3');
 const Anthropic = require('@anthropic-ai/sdk');
+const { OpenAI } = require('openai');
 
 const app = express();
 app.use(cors());
@@ -23,7 +24,11 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 // The bot will listen to messages in that channel with prefix !ai or !tiger
 const DISCORD_COMMAND_CHANNEL = process.env.DISCORD_COMMAND_CHANNEL || null;
 
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const USE_OPENAI = !ANTHROPIC_API_KEY || !!OPENAI_API_KEY; // use OpenAI if set
+
+const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY || 'placeholder' });
+const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
 // ── SQLite ───────────────────────────────────────────────────────────────────
 const db = new Database('/tmp/tnh_inbox.db');
@@ -335,6 +340,15 @@ Rules:
 
   const messages = [{ role: 'user', content: userMessage }];
 
+  // Use OpenAI if available, else Anthropic
+  if (openai) {
+    return await processWithOpenAI(userMessage, systemPrompt, messages);
+  } else {
+    return await processWithAnthropic(systemPrompt, messages);
+  }
+}
+
+async function processWithAnthropic(systemPrompt, messages) {
   let response = await anthropic.messages.create({
     model: 'claude-sonnet-4-20250514',
     max_tokens: 1024,
@@ -343,7 +357,6 @@ Rules:
     messages
   });
 
-  // Agentic loop
   while (response.stop_reason === 'tool_use') {
     const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
     const toolResults = [];
@@ -364,6 +377,59 @@ Rules:
 
   const textBlock = response.content.find(b => b.type === 'text');
   return textBlock ? textBlock.text : 'Done.';
+}
+
+// Convert Anthropic tool schema to OpenAI function schema
+function toOpenAITools(anthropicTools) {
+  return anthropicTools.map(t => ({
+    type: 'function',
+    function: {
+      name: t.name,
+      description: t.description,
+      parameters: t.input_schema
+    }
+  }));
+}
+
+async function processWithOpenAI(userMessage, systemPrompt, messages) {
+  const oaiMessages = [
+    { role: 'system', content: systemPrompt },
+    ...messages
+  ];
+  const oaiTools = toOpenAITools(tools);
+
+  let response = await openai.chat.completions.create({
+    model: 'gpt-4o',
+    max_tokens: 1024,
+    messages: oaiMessages,
+    tools: oaiTools,
+    tool_choice: 'auto'
+  });
+
+  // Agentic loop
+  while (response.choices[0].finish_reason === 'tool_calls') {
+    const msg = response.choices[0].message;
+    oaiMessages.push(msg);
+
+    for (const toolCall of msg.tool_calls || []) {
+      const result = await executeTool(toolCall.function.name, JSON.parse(toolCall.function.arguments));
+      oaiMessages.push({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        content: result
+      });
+    }
+
+    response = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      max_tokens: 1024,
+      messages: oaiMessages,
+      tools: oaiTools,
+      tool_choice: 'auto'
+    });
+  }
+
+  return response.choices[0].message.content || 'Done.';
 }
 
 // ── Discord Bot Message Polling ───────────────────────────────────────────────
@@ -577,7 +643,9 @@ app.get('/health', (req, res) => {
     time: new Date().toISOString(),
     nextBriefing: '7:00 AM PHT daily',
     discordBot: DISCORD_BOT_TOKEN ? '✅ configured' : '❌ missing',
-    anthropicAI: ANTHROPIC_API_KEY ? '✅ configured' : '⚠️ missing — set ANTHROPIC_API_KEY',
+    aiProvider: openai ? '✅ OpenAI (gpt-4o)' : (ANTHROPIC_API_KEY ? '✅ Anthropic (claude)' : '❌ no AI key set'),
+    anthropicAI: ANTHROPIC_API_KEY ? '✅ configured' : '⚠️ missing',
+    openAI: OPENAI_API_KEY ? '✅ configured' : 'not set',
     discordCommandChannel: DISCORD_COMMAND_CHANNEL ? `✅ ${DISCORD_COMMAND_CHANNEL}` : '⚠️ not set — set DISCORD_COMMAND_CHANNEL env var',
     linkedGroups: db.prepare('SELECT COUNT(*) as c FROM group_links').get().c,
     totalMessages: db.prepare('SELECT COUNT(*) as c FROM message_history').get().c,
@@ -618,5 +686,6 @@ app.listen(PORT, () => {
   console.log(`✅ inbox.tigernethost.com on port ${PORT} • Node ${process.version}`);
   console.log(`⏰ Morning briefing: 7:00 AM PHT daily`);
   console.log(`🤖 Discord AI: ${DISCORD_COMMAND_CHANNEL ? `polling channel ${DISCORD_COMMAND_CHANNEL} every 3s` : '⚠️  set DISCORD_COMMAND_CHANNEL env var'}`);
-  console.log(`🧠 Anthropic AI: ${ANTHROPIC_API_KEY ? 'ready' : '⚠️  set ANTHROPIC_API_KEY env var'}`);
+  console.log(`🧠 AI Provider: ${openai ? 'OpenAI gpt-4o ✅' : (ANTHROPIC_API_KEY ? 'Anthropic claude ✅' : '⚠️  set OPENAI_API_KEY or ANTHROPIC_API_KEY')}`);
 });
+
