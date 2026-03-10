@@ -315,6 +315,33 @@ const tools = [
     name: 'list_zoom_meetings',
     description: 'List upcoming scheduled Zoom meetings',
     input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'delete_zoom_meeting',
+    description: 'Delete/cancel a Zoom meeting by its meeting ID',
+    input_schema: {
+      type: 'object',
+      properties: {
+        meeting_id: { type: 'string', description: 'Zoom meeting ID to delete' }
+      },
+      required: ['meeting_id']
+    }
+  },
+  {
+    name: 'update_zoom_meeting',
+    description: 'Update an existing Zoom meeting topic, time, or duration',
+    input_schema: {
+      type: 'object',
+      properties: {
+        meeting_id: { type: 'string', description: 'Zoom meeting ID' },
+        topic: { type: 'string', description: 'New meeting topic/title' },
+        date: { type: 'string', description: 'New date YYYY-MM-DD' },
+        start_time: { type: 'string', description: 'New start time HH:MM (24hr PHT)' },
+        duration: { type: 'number', description: 'Duration in minutes' },
+        agenda: { type: 'string', description: 'Meeting agenda' }
+      },
+      required: ['meeting_id']
+    }
   }
 ];
 
@@ -458,6 +485,24 @@ async function executeTool(toolName, toolInput) {
         duration: m.duration, joinUrl: m.join_url
       }));
       return JSON.stringify({ count: meetings.length, meetings });
+    }
+
+    if (toolName === 'delete_zoom_meeting') {
+      await zoom(`/meetings/${toolInput.meeting_id}`, 'DELETE');
+      return JSON.stringify({ success: true, deleted: true, meetingId: toolInput.meeting_id });
+    }
+
+    if (toolName === 'update_zoom_meeting') {
+      const body = {};
+      if (toolInput.topic) body.topic = toolInput.topic;
+      if (toolInput.agenda) body.agenda = toolInput.agenda;
+      if (toolInput.duration) body.duration = toolInput.duration;
+      if (toolInput.date && toolInput.start_time) {
+        body.start_time = `${toolInput.date}T${toolInput.start_time}:00`;
+        body.timezone = 'Asia/Manila';
+      }
+      await zoom(`/meetings/${toolInput.meeting_id}`, 'PATCH', body);
+      return JSON.stringify({ success: true, updated: true, meetingId: toolInput.meeting_id, changes: body });
     }
 
     return JSON.stringify({ error: `Unknown tool: ${toolName}` });
@@ -919,6 +964,7 @@ app.listen(PORT, () => {
   console.log(`🤖 Discord AI: ${DISCORD_COMMAND_CHANNEL ? `polling channel ${DISCORD_COMMAND_CHANNEL} every 3s` : '⚠️  set DISCORD_COMMAND_CHANNEL env var'}`);
   console.log(`🧠 AI Provider: ${openai ? 'OpenAI gpt-4o ✅' : (ANTHROPIC_API_KEY ? 'Anthropic claude ✅' : '⚠️  set OPENAI_API_KEY or ANTHROPIC_API_KEY')}`);
 });
+
 
 
 
