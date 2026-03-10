@@ -24,6 +24,18 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 // The bot will listen to messages in that channel with prefix !ai or !tiger
 const DISCORD_COMMAND_CHANNEL = process.env.DISCORD_COMMAND_CHANNEL || null;
 
+// Google Calendar
+const GCAL_TOKEN      = process.env.GCAL_TOKEN;       // OAuth2 access token
+const GCAL_REFRESH    = process.env.GCAL_REFRESH;     // OAuth2 refresh token
+const GCAL_CLIENT_ID  = process.env.GCAL_CLIENT_ID;
+const GCAL_CLIENT_SEC = process.env.GCAL_CLIENT_SECRET;
+const GCAL_CALENDAR   = process.env.GCAL_CALENDAR_ID || 'tigernethost@gmail.com';
+
+// Zoom
+const ZOOM_ACCOUNT_ID    = process.env.ZOOM_ACCOUNT_ID;
+const ZOOM_CLIENT_ID     = process.env.ZOOM_CLIENT_ID;
+const ZOOM_CLIENT_SECRET = process.env.ZOOM_CLIENT_SECRET;
+
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const USE_OPENAI = !ANTHROPIC_API_KEY || !!OPENAI_API_KEY; // use OpenAI if set
 
@@ -128,6 +140,65 @@ const setMode = (chatId, mode) => {
     .run(String(chatId), mode);
 };
 
+// ── Google Calendar Helper ───────────────────────────────────────────────────
+let gcalAccessToken = GCAL_TOKEN || null;
+let gcalTokenExpiry = 0;
+
+async function refreshGCalToken() {
+  if (!GCAL_REFRESH || !GCAL_CLIENT_ID || !GCAL_CLIENT_SEC) return null;
+  try {
+    const { data } = await axios.post('https://oauth2.googleapis.com/token', new URLSearchParams({
+      client_id: GCAL_CLIENT_ID,
+      client_secret: GCAL_CLIENT_SEC,
+      refresh_token: GCAL_REFRESH,
+      grant_type: 'refresh_token'
+    }).toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+    gcalAccessToken = data.access_token;
+    gcalTokenExpiry = Date.now() + (data.expires_in * 1000) - 60000;
+    console.log('[GCal] Token refreshed');
+    return gcalAccessToken;
+  } catch (e) {
+    console.error('[GCal] Token refresh failed:', e.message);
+    return null;
+  }
+}
+
+async function gcal(endpoint, method = 'GET', body = null, params = {}) {
+  if (!gcalAccessToken && !GCAL_REFRESH) throw new Error('Google Calendar not configured. Set GCAL_REFRESH, GCAL_CLIENT_ID, GCAL_CLIENT_SECRET env vars.');
+  if (gcalTokenExpiry && Date.now() > gcalTokenExpiry) await refreshGCalToken();
+  const url = new URL(`https://www.googleapis.com/calendar/v3${endpoint}`);
+  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+  const config = { method, url: url.toString(), headers: { Authorization: `Bearer ${gcalAccessToken}` } };
+  if (body) config.data = body;
+  const { data } = await axios(config);
+  return data;
+}
+
+// ── Zoom Helper ───────────────────────────────────────────────────────────────
+let zoomAccessToken = null;
+let zoomTokenExpiry = 0;
+
+async function getZoomToken() {
+  if (zoomAccessToken && Date.now() < zoomTokenExpiry) return zoomAccessToken;
+  if (!ZOOM_ACCOUNT_ID || !ZOOM_CLIENT_ID || !ZOOM_CLIENT_SECRET) throw new Error('Zoom not configured. Set ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET env vars.');
+  const credentials = Buffer.from(`${ZOOM_CLIENT_ID}:${ZOOM_CLIENT_SECRET}`).toString('base64');
+  const { data } = await axios.post(
+    `https://zoom.us/oauth/token?grant_type=account_credentials&account_id=${ZOOM_ACCOUNT_ID}`,
+    {}, { headers: { Authorization: `Basic ${credentials}`, 'Content-Type': 'application/json' } }
+  );
+  zoomAccessToken = data.access_token;
+  zoomTokenExpiry = Date.now() + (data.expires_in * 1000) - 60000;
+  return zoomAccessToken;
+}
+
+async function zoom(endpoint, method = 'GET', body = null) {
+  const token = await getZoomToken();
+  const config = { method, url: `https://api.zoom.us/v2${endpoint}`, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } };
+  if (body) config.data = body;
+  const { data } = await axios(config);
+  return data;
+}
+
 // ── AI Tools (Functions Claude can call) ─────────────────────────────────────
 const tools = [
   {
@@ -208,6 +279,54 @@ const tools = [
   {
     name: 'get_overdue_summary',
     description: 'Get a full overdue summary across WHMCS and Manager.io',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_calendar_events',
+    description: 'Get upcoming events from Google Calendar',
+    input_schema: {
+      type: 'object',
+      properties: {
+        days: { type: 'number', description: 'How many days ahead to look (default 7)' },
+        query: { type: 'string', description: 'Optional search query' }
+      }
+    }
+  },
+  {
+    name: 'create_calendar_event',
+    description: 'Create a new event in Google Calendar',
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Event title/summary' },
+        date: { type: 'string', description: 'Date in YYYY-MM-DD format' },
+        start_time: { type: 'string', description: 'Start time in HH:MM (24hr) format, e.g. 14:00' },
+        end_time: { type: 'string', description: 'End time in HH:MM (24hr) format, e.g. 15:00' },
+        description: { type: 'string', description: 'Event description or notes' },
+        location: { type: 'string', description: 'Physical location or meeting link' },
+        attendees: { type: 'array', items: { type: 'string' }, description: 'List of attendee email addresses' }
+      },
+      required: ['title', 'date', 'start_time', 'end_time']
+    }
+  },
+  {
+    name: 'create_zoom_meeting',
+    description: 'Create a new Zoom meeting and get the join link',
+    input_schema: {
+      type: 'object',
+      properties: {
+        topic: { type: 'string', description: 'Meeting topic/title' },
+        date: { type: 'string', description: 'Date in YYYY-MM-DD format' },
+        start_time: { type: 'string', description: 'Start time in HH:MM (24hr PHT) format' },
+        duration: { type: 'number', description: 'Duration in minutes (default 60)' },
+        agenda: { type: 'string', description: 'Meeting agenda or description' }
+      },
+      required: ['topic', 'date', 'start_time']
+    }
+  },
+  {
+    name: 'list_zoom_meetings',
+    description: 'List upcoming scheduled Zoom meetings',
     input_schema: { type: 'object', properties: {} }
   }
 ];
@@ -307,6 +426,73 @@ async function executeTool(toolName, toolInput) {
         mgrCount = unpaid.length;
       } catch (e) {}
       return JSON.stringify({ whmcsOverdue: overdue.length, whmcsTotal: overdue.reduce((s, i) => s + parseFloat(i.total), 0), byClient, managerIoUnpaid: mgrCount, managerIoTotal: mgrTotal });
+    }
+
+    if (toolName === 'get_calendar_events') {
+      const days = toolInput.days || 7;
+      const now = new Date();
+      const end = new Date(now.getTime() + days * 86400000);
+      const params = {
+        timeMin: now.toISOString(),
+        timeMax: end.toISOString(),
+        singleEvents: 'true',
+        orderBy: 'startTime',
+        maxResults: '20'
+      };
+      if (toolInput.query) params.q = toolInput.query;
+      const data = await gcal(`/calendars/${encodeURIComponent(GCAL_CALENDAR)}/events`, 'GET', null, params);
+      const events = (data.items || []).map(e => ({
+        id: e.id,
+        title: e.summary,
+        start: e.start?.dateTime || e.start?.date,
+        end: e.end?.dateTime || e.end?.date,
+        location: e.location,
+        description: e.description,
+        attendees: (e.attendees || []).map(a => a.email)
+      }));
+      return JSON.stringify({ count: events.length, events });
+    }
+
+    if (toolName === 'create_calendar_event') {
+      const tz = 'Asia/Manila';
+      const startDT = `${toolInput.date}T${toolInput.start_time}:00`;
+      const endDT = `${toolInput.date}T${toolInput.end_time}:00`;
+      const event = {
+        summary: toolInput.title,
+        description: toolInput.description || '',
+        location: toolInput.location || '',
+        start: { dateTime: startDT, timeZone: tz },
+        end: { dateTime: endDT, timeZone: tz }
+      };
+      if (toolInput.attendees?.length) {
+        event.attendees = toolInput.attendees.map(e => ({ email: e }));
+      }
+      const data = await gcal(`/calendars/${encodeURIComponent(GCAL_CALENDAR)}/events`, 'POST', event);
+      return JSON.stringify({ success: true, eventId: data.id, title: data.summary, start: data.start?.dateTime, link: data.htmlLink });
+    }
+
+    if (toolName === 'create_zoom_meeting') {
+      const startDT = `${toolInput.date}T${toolInput.start_time}:00`;
+      const body = {
+        topic: toolInput.topic,
+        type: 2, // scheduled
+        start_time: startDT,
+        duration: toolInput.duration || 60,
+        timezone: 'Asia/Manila',
+        agenda: toolInput.agenda || '',
+        settings: { host_video: true, participant_video: true, waiting_room: true, auto_recording: 'none' }
+      };
+      const data = await zoom('/users/me/meetings', 'POST', body);
+      return JSON.stringify({ success: true, meetingId: data.id, topic: data.topic, joinUrl: data.join_url, startUrl: data.start_url, password: data.password, startTime: data.start_time, duration: data.duration });
+    }
+
+    if (toolName === 'list_zoom_meetings') {
+      const data = await zoom('/users/me/meetings?type=scheduled&page_size=10');
+      const meetings = (data.meetings || []).map(m => ({
+        id: m.id, topic: m.topic, startTime: m.start_time,
+        duration: m.duration, joinUrl: m.join_url
+      }));
+      return JSON.stringify({ count: meetings.length, meetings });
     }
 
     return JSON.stringify({ error: `Unknown tool: ${toolName}` });
@@ -617,6 +803,25 @@ async function sendMorningBriefing() {
     if (mgrQuotes.length > 0) fields.push({ name: '📋 Quotes', value: `**${mgrQuotes.length}** pending`, inline: true });
     if (overdue.length > 0) fields.push({ name: '⚠️ Overdue', value: overdue.map(i => `• #${i.id} — ${i.currencyprefix || '₱'}${parseFloat(i.total).toFixed(2)} (${i.duedate})`).join('\n'), inline: false });
     if (soon.length > 0) fields.push({ name: '📅 Due Soon', value: soon.map(i => `• #${i.id} — ${i.currencyprefix || '₱'}${parseFloat(i.total).toFixed(2)} (${i.duedate})`).join('\n'), inline: false });
+    // Add today's calendar events
+    try {
+      const now2 = new Date();
+      const endOfDay = new Date(now2); endOfDay.setHours(23,59,59,999);
+      const calData = await gcal(`/calendars/${encodeURIComponent(GCAL_CALENDAR)}/events`, 'GET', null, {
+        timeMin: now2.toISOString(), timeMax: endOfDay.toISOString(),
+        singleEvents: 'true', orderBy: 'startTime', maxResults: '10'
+      });
+      const todayEvents = calData.items || [];
+      if (todayEvents.length > 0) {
+        fields.push({ name: '📅 Today\'s Schedule', value: todayEvents.map(e => {
+          const t = e.start?.dateTime ? new Date(e.start.dateTime).toLocaleTimeString('en-PH', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Manila' }) : 'All day';
+          return `• ${t} — ${e.summary}${e.location ? ' @ ' + e.location : ''}`;
+        }).join('\n'), inline: false });
+      } else {
+        fields.push({ name: '📅 Today\'s Schedule', value: 'No meetings scheduled today', inline: false });
+      }
+    } catch (e) { console.log('[GCal Briefing]', e.message); }
+
     fields.push({ name: '💡 Discord AI Commands', value: '`!ai <your command>` in your command channel\nExample: `!ai show overdue invoices` or `!ai cancel invoice #1234`', inline: false });
 
     await axios.post(DISCORD_WEBHOOK, {
@@ -647,6 +852,8 @@ app.get('/health', (req, res) => {
     anthropicAI: ANTHROPIC_API_KEY ? '✅ configured' : '⚠️ missing',
     openAI: OPENAI_API_KEY ? '✅ configured' : 'not set',
     discordCommandChannel: DISCORD_COMMAND_CHANNEL ? `✅ ${DISCORD_COMMAND_CHANNEL}` : '⚠️ not set — set DISCORD_COMMAND_CHANNEL env var',
+    googleCalendar: (GCAL_REFRESH && GCAL_CLIENT_ID) ? '✅ configured' : (GCAL_TOKEN ? '✅ token only' : '⚠️ not configured'),
+    zoom: (ZOOM_ACCOUNT_ID && ZOOM_CLIENT_ID) ? '✅ configured' : '⚠️ not configured',
     linkedGroups: db.prepare('SELECT COUNT(*) as c FROM group_links').get().c,
     totalMessages: db.prepare('SELECT COUNT(*) as c FROM message_history').get().c,
     discordCommandsRun: db.prepare('SELECT COUNT(*) as c FROM discord_commands').get().c,
@@ -688,4 +895,5 @@ app.listen(PORT, () => {
   console.log(`🤖 Discord AI: ${DISCORD_COMMAND_CHANNEL ? `polling channel ${DISCORD_COMMAND_CHANNEL} every 3s` : '⚠️  set DISCORD_COMMAND_CHANNEL env var'}`);
   console.log(`🧠 AI Provider: ${openai ? 'OpenAI gpt-4o ✅' : (ANTHROPIC_API_KEY ? 'Anthropic claude ✅' : '⚠️  set OPENAI_API_KEY or ANTHROPIC_API_KEY')}`);
 });
+
 
