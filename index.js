@@ -24,17 +24,16 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 // The bot will listen to messages in that channel with prefix !ai or !tiger
 const DISCORD_COMMAND_CHANNEL = process.env.DISCORD_COMMAND_CHANNEL || null;
 
-// Google Calendar
-const GCAL_TOKEN      = process.env.GCAL_TOKEN;       // OAuth2 access token
-const GCAL_REFRESH    = process.env.GCAL_REFRESH;     // OAuth2 refresh token
+// Google Calendar (OAuth2)
+const GCAL_REFRESH    = process.env.GCAL_REFRESH;
 const GCAL_CLIENT_ID  = process.env.GCAL_CLIENT_ID;
 const GCAL_CLIENT_SEC = process.env.GCAL_CLIENT_SECRET;
 const GCAL_CALENDAR   = process.env.GCAL_CALENDAR_ID || 'tigernethost@gmail.com';
 
-// Zoom
-const ZOOM_ACCOUNT_ID    = process.env.ZOOM_ACCOUNT_ID;
-const ZOOM_CLIENT_ID     = process.env.ZOOM_CLIENT_ID;
-const ZOOM_CLIENT_SECRET = process.env.ZOOM_CLIENT_SECRET;
+// Zoom (Server-to-Server OAuth)
+const ZOOM_ACCOUNT_ID    = process.env.ZOOM_ACCOUNT_ID    || 'eKCXh0p9S8CF3rdzoumV1A';
+const ZOOM_CLIENT_ID     = process.env.ZOOM_CLIENT_ID     || 'NA1Vn2iHSQ2gL3L8hJI1vA';
+const ZOOM_CLIENT_SECRET = process.env.ZOOM_CLIENT_SECRET || '9jQUsrBexobvfAX0hQPD4K2W1QW0Jz9U';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const USE_OPENAI = !ANTHROPIC_API_KEY || !!OPENAI_API_KEY; // use OpenAI if set
@@ -895,5 +894,6 @@ app.listen(PORT, () => {
   console.log(`🤖 Discord AI: ${DISCORD_COMMAND_CHANNEL ? `polling channel ${DISCORD_COMMAND_CHANNEL} every 3s` : '⚠️  set DISCORD_COMMAND_CHANNEL env var'}`);
   console.log(`🧠 AI Provider: ${openai ? 'OpenAI gpt-4o ✅' : (ANTHROPIC_API_KEY ? 'Anthropic claude ✅' : '⚠️  set OPENAI_API_KEY or ANTHROPIC_API_KEY')}`);
 });
+
 
 
